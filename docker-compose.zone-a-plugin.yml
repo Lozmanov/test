@@ -1,0 +1,50 @@
+#################################################################################
+# Copyright (c) 2014-2019 WANdisco
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Apache License, Version 2.0
+#
+################################################################################
+#
+# Note: while version 3.7 is technically compatible with Docker 18.06 and
+# higher, this project was tested with only Docker 18.09 as of 2019-08-06.
+#
+################################################################################
+
+version: "3.7"
+
+services:
+  debug:
+    volumes:
+      - logging-sandbox-hdp:/debug/sandbox-hdp
+
+  fusion-livehive-proxy-sandbox-hdp:
+    image: wandisco/fusion-livehive-proxy-hdp-2.6.5:7.0.0.6-3800
+    depends_on:
+      - fusion-server-sandbox-hdp
+    networks:
+      - fusion
+    env_file:
+      - "zone_a.env"
+    ports:
+      - 9083:9083
+    volumes:
+      - logging-sandbox-hdp:/var/log/fusion
+      - fusion-sandbox-hdp-etc-wandisco:/etc/wandisco
+      - fusion-sandbox-hdp-etc-hadoop:/etc/hadoop
+
+
+networks:
+  # One Docker network is shared between both zones
+  fusion:
+
+volumes:
+  logging-sandbox-hdp:
+  fusion-sandbox-hdp-etc-hadoop:
+  fusion-sandbox-hdp-etc-wandisco:
+
+

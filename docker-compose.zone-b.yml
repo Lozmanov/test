@@ -1,0 +1,122 @@
+#################################################################################
+# Copyright (c) 2014-2019 WANdisco
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Apache License, Version 2.0
+#
+################################################################################
+#
+# This docker-compose.yml file creates all WANdisco Fusion services needed to
+# stand up an HDI zone.
+#
+# Services running in each zone
+#     Zone
+#         Fusion UI Server HDI  (fusion-ui-server-adls2)
+#         Fusion IHC Server     (fusion-ihc-server-adls2)
+#         Fusion Server         (fusion-server-adls2)
+#
+# Note: while version 3.7 is technically compatible with Docker 18.06 and
+# higher, this project was tested with only Docker 18.09 as of 2019-08-06.
+
+version: "3.7"
+
+services:
+  debug:
+    image: ubuntu
+    command: ["tail", "-f", "/dev/null"]
+    volumes:
+      - logging-adls2:/debug/adls2
+    networks:
+      - fusion
+
+  # Fusion UI Server
+  fusion-ui-server-adls2:
+    image: wandisco/fusion-ui-server-hcfs-azure-hdi-3.6:2.15.2.1-3800
+    restart: unless-stopped
+    depends_on:
+      - fusion-server-adls2
+    networks:
+      - fusion
+    ports:
+      - 8583:8583
+      - 8943:8943
+    env_file:
+      - "zone_b.env"
+    volumes:
+      - logging-adls2:/var/log/fusion
+      - fusion-adls2-opt-wandisco-fusion-server-checkpoint:/opt/wandisco/fusion/server/checkpoint
+      - fusion-adls2-opt-wandisco-fusion-server-dcone:/opt/wandisco/fusion/server/dcone
+      - fusion-adls2-opt-wandisco-fusion-ui-server-properties:/opt/wandisco/fusion-ui-server/properties
+      - fusion-adls2-etc-wandisco:/etc/wandisco
+      - fusion-adls2-restart:/restart
+      - fusion-license:/etc/wandisco/license
+
+  # Fusion IHC Server
+  fusion-ihc-server-adls2:
+    image: wandisco/fusion-ihc-server-hcfs-azure-hdi-3.6:2.15.2.1-3800
+    restart: unless-stopped
+    depends_on:
+      - fusion-server-adls2
+    networks:
+      - fusion
+    ports:
+      - 7500:7500
+      - 7501:7501
+      - 9502:9502
+    env_file:
+      - "zone_b.env"
+    volumes:
+      - logging-adls2:/var/log/fusion
+      - fusion-adls2-opt-wandisco-fusion-server-checkpoint:/opt/wandisco/fusion/server/checkpoint
+      - fusion-adls2-etc-wandisco:/etc/wandisco
+      - fusion-adls2-restart:/restart
+      - fusion-license:/etc/wandisco/license
+
+  # Fusion Server
+  fusion-server-adls2:
+    image: wandisco/fusion-server-hcfs-azure-hdi-3.6:2.15.2.1-3800
+    restart: unless-stopped
+    networks:
+      - fusion
+    ports:
+      - 8524:8524
+      - 8523:8523
+      - 8582:8582
+      - 8584:8584
+      - 6944:6944
+    environment:
+      - DB_ACTION=
+    env_file:
+      - "zone_b.env"
+    volumes:
+      - logging-adls2:/var/log/fusion
+      - fusion-adls2-opt-wandisco-fusion-server-checkpoint:/opt/wandisco/fusion/server/checkpoint
+      - fusion-adls2-opt-wandisco-fusion-server-dcone:/opt/wandisco/fusion/server/dcone
+      - fusion-adls2-opt-wandisco-fusion-ui-server-properties:/opt/wandisco/fusion-ui-server/properties
+      - fusion-adls2-etc-wandisco:/etc/wandisco
+      - fusion-adls2-restart:/restart
+      - fusion-license:/etc/wandisco/license
+
+networks:
+  # One Docker network is shared between both zones
+  fusion: {}
+
+volumes:
+  # The named logging volumes for all components
+  logging-adls2:
+
+  # Checkpoint volume (confirm if this is needed to persist across container restarts)
+  fusion-adls2-opt-wandisco-fusion-server-checkpoint:
+
+  # dcone volume to persist database changes across restarts
+  fusion-adls2-opt-wandisco-fusion-server-dcone:
+
+  fusion-adls2-etc-wandisco:
+  fusion-adls2-opt-wandisco-fusion-ui-server-properties:
+  fusion-adls2-etc-wandisco:
+
+  fusion-license:
