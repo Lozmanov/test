@@ -26,6 +26,7 @@ var commands = map[string]string{
 }
 
 // buildClasspath собирает classpath из JAR-файлов и .classpath-файлов дистрибутива.
+// Директория конфигов ставится первой — Hadoop загружает ozone-site.xml через ClassLoader.
 func buildClasspath() string {
 	seen := make(map[string]struct{})
 	var entries []string
@@ -35,6 +36,12 @@ func buildClasspath() string {
 			seen[path] = struct{}{}
 			entries = append(entries, path)
 		}
+	}
+
+	// Директория конфигов должна быть первой в classpath
+	confDir := ozoneHome + "/etc/hadoop"
+	if info, err := os.Stat(confDir); err == nil && info.IsDir() {
+		add(confDir)
 	}
 
 	// Все JAR из основной директории и поддиректорий share/ozone/lib/
