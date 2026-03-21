@@ -27,6 +27,9 @@ var commands = map[string]string{
 
 // buildClasspath собирает classpath из JAR-файлов и .classpath-файлов дистрибутива.
 // Директория конфигов ставится первой — Hadoop загружает ozone-site.xml через ClassLoader.
+// Порядок приоритетов: conf dir → .classpath файлы (build-time порядок) → lib/*.jar fallback.
+// .classpath файлы генерируются при сборке Ozone и содержат единственно верный порядок JAR-ов.
+// Glob lib/*.jar используется только если .classpath файлы отсутствуют.
 func buildClasspath() string {
 	seen := make(map[string]struct{})
 	var entries []string
@@ -44,17 +47,8 @@ func buildClasspath() string {
 		add(confDir)
 	}
 
-	// Все JAR из основной директории и поддиректорий share/ozone/lib/
-	jars, _ := filepath.Glob(ozoneHome + "/share/ozone/lib/*.jar")
-	for _, j := range jars {
-		add(j)
-	}
-	subJars, _ := filepath.Glob(ozoneHome + "/share/ozone/lib/**/*.jar")
-	for _, j := range subJars {
-		add(j)
-	}
-
-	// Разбираем .classpath-файлы (формат: одна запись на строку или через двоеточие)
+	// Разбираем .classpath-файлы (формат: одна запись на строку или через двоеточие).
+	// Этот порядок воспроизводит оригинальный ozone-shell-скрипт.
 	cpFiles, _ := filepath.Glob(ozoneHome + "/share/ozone/classpath/*.classpath")
 	for _, cpFile := range cpFiles {
 		f, err := os.Open(cpFile)
@@ -75,6 +69,14 @@ func buildClasspath() string {
 			}
 		}
 		f.Close()
+	}
+
+	// Fallback: если .classpath файлы отсутствуют — берём все JAR из lib/ напрямую.
+	if len(entries) <= 1 {
+		jars, _ := filepath.Glob(ozoneHome + "/share/ozone/lib/*.jar")
+		for _, j := range jars {
+			add(j)
+		}
 	}
 
 	return strings.Join(entries, ":")
