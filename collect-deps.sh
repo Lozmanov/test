@@ -193,6 +193,15 @@ echo ">>> NSS libraries"
 for nss_so in /lib64/libnss_*.so* /lib/libnss_*.so* /usr/lib64/libnss_*.so* /usr/lib/libnss_*.so*; do
     [ -f "$nss_so" ] || continue
     copy_file "$nss_so"
+    ldd "$nss_so" 2>/dev/null | awk '/=>/ {print $3}' | while read -r lib; do
+        [ -f "$lib" ] || continue
+        copy_file "$lib"
+    done
+done
+
+for resolv_so in /lib64/libresolv.so* /lib/libresolv.so* /usr/lib64/libresolv.so* /usr/lib/libresolv.so*; do
+    [ -f "$resolv_so" ] || continue
+    copy_file "$resolv_so"
 done
 
 # ── 6. Системные конфигурационные файлы ──────────────────────────────────────
