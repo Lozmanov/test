@@ -25,12 +25,23 @@ var commands = map[string]string{
 	"recon":    "org.apache.hadoop.ozone.recon.ReconServer",
 }
 
-// buildClasspath собирает classpath из JAR-файлов и .classpath-файлов дистрибутива.
-// Директория конфигов ставится первой — Hadoop загружает ozone-site.xml через ClassLoader.
-// Порядок приоритетов: conf dir → .classpath файлы (build-time порядок) → lib/*.jar fallback.
-// .classpath файлы генерируются при сборке Ozone и содержат единственно верный порядок JAR-ов.
-// Glob lib/*.jar используется только если .classpath файлы отсутствуют.
-func buildClasspath() string {
+// Маппинг команд на OZONE_RUN_ARTIFACT_NAME (имя .classpath файла без расширения).
+// Соответствует значениям из bin/ozone shell-скрипта.
+var artifactNames = map[string]string{
+	"datanode": "ozone-datanode",
+	"om":       "ozone-manager",
+	"scm":      "hdds-server-scm",
+	"s3g":      "ozone-s3gateway",
+	"recon":    "ozone-recon",
+}
+
+// buildClasspath собирает classpath для конкретной команды Ozone.
+// Читает только соответствующий .classpath файл (как оригинальный shell-скрипт через OZONE_RUN_ARTIFACT_NAME),
+// раскрывает переменную $HDDS_LIB_JARS_DIR и отрезает префикс "classpath=".
+// Glob lib/*.jar добавляет любые JAR-ы, не попавшие в .classpath файл.
+func buildClasspath(command string) string {
+	libDir := ozoneHome + "/share/ozone/lib"
+
 	seen := make(map[string]struct{})
 	var entries []string
 
@@ -47,36 +58,39 @@ func buildClasspath() string {
 		add(confDir)
 	}
 
-	// Разбираем .classpath-файлы (формат: одна запись на строку или через двоеточие).
-	// Этот порядок воспроизводит оригинальный ozone-shell-скрипт.
-	cpFiles, _ := filepath.Glob(ozoneHome + "/share/ozone/classpath/*.classpath")
-	for _, cpFile := range cpFiles {
-		f, err := os.Open(cpFile)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			for _, part := range strings.Split(line, ":") {
-				part = strings.TrimSpace(part)
-				if part != "" {
-					add(part)
+	// Читаем только .classpath файл для данной команды.
+	// Формат файла: classpath=$HDDS_LIB_JARS_DIR/a.jar:$HDDS_LIB_JARS_DIR/b.jar:...
+	// $HDDS_LIB_JARS_DIR раскрываем в реальный путь к lib/.
+	if artifact, ok := artifactNames[command]; ok {
+		cpFile := ozoneHome + "/share/ozone/classpath/" + artifact + ".classpath"
+		if f, err := os.Open(cpFile); err == nil {
+			scanner := bufio.NewScanner(f)
+			scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // classpath строка длинная
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				// Убираем префикс "classpath=" если есть
+				line = strings.TrimPrefix(line, "classpath=")
+				for _, part := range strings.Split(line, ":") {
+					part = strings.TrimSpace(part)
+					// Раскрываем $HDDS_LIB_JARS_DIR
+					part = strings.ReplaceAll(part, "$HDDS_LIB_JARS_DIR", libDir)
+					if part != "" {
+						add(part)
+					}
 				}
 			}
+			f.Close()
 		}
-		f.Close()
 	}
 
-	// Fallback: если .classpath файлы отсутствуют — берём все JAR из lib/ напрямую.
-	if len(entries) <= 1 {
-		jars, _ := filepath.Glob(ozoneHome + "/share/ozone/lib/*.jar")
-		for _, j := range jars {
-			add(j)
-		}
+	// Дополняем JAR-ами из lib/, которые не попали в .classpath файл.
+	// seen-map гарантирует сохранение порядка из .classpath для уже добавленных JAR-ов.
+	jars, _ := filepath.Glob(libDir + "/*.jar")
+	for _, j := range jars {
+		add(j)
 	}
 
 	return strings.Join(entries, ":")
@@ -176,7 +190,7 @@ func main() {
 	//   2. Всегда — ozone scm --bootstrap
 	//   3. exec ozone scm
 	case "scm-start":
-		classpath := buildClasspath()
+		classpath := buildClasspath("scm")
 		podName := os.Getenv("POD_NAME")
 		if strings.HasSuffix(podName, "-0-0") {
 			versionFile := "/data/metadata/scm/current/VERSION"
@@ -201,7 +215,7 @@ func main() {
 	//   1. Если VERSION-файл отсутствует — выполнить ozone om --init
 	//   2. exec ozone om
 	case "om-start":
-		classpath := buildClasspath()
+		classpath := buildClasspath("om")
 		versionFile := "/data/metadata/om/current/VERSION"
 		if _, err := os.Stat(versionFile); os.IsNotExist(err) {
 			logf("Initializing OM cluster...")
@@ -222,7 +236,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Available commands: datanode, om, scm, s3g, recon, scm-start, om-start, idle")
 			os.Exit(1)
 		}
-		classpath := buildClasspath()
+		classpath := buildClasspath(command)
 		execJava(mainClass, classpath, os.Args[2:], env)
 	}
 }
