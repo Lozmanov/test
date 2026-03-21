@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -168,10 +169,30 @@ func logf(format string, a ...interface{}) {
 	fmt.Printf("[%s] %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, a...))
 }
 
+// waitFor опрашивает TCP-адрес addr (host:port) каждые interval до таймаута.
+// Используется в init-контейнерах вместо "while ! nc -z host port; do sleep 1; done".
+func waitFor(addr string, timeout, interval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	logf("Waiting for %s (timeout: %s, interval: %s)", addr, timeout, interval)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, interval)
+		if err == nil {
+			conn.Close()
+			logf("%s is available", addr)
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for %s: %v", addr, err)
+		}
+		time.Sleep(interval)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: ozone <command> [args...]")
 		fmt.Fprintln(os.Stderr, "Commands: datanode, om, scm, s3g, recon, scm-start, om-start, idle")
+		fmt.Fprintln(os.Stderr, "          wait-for <host:port> [--timeout=120s] [--interval=2s]")
 		os.Exit(1)
 	}
 
@@ -183,6 +204,36 @@ func main() {
 	// idle — бесконечное ожидание для утилитарных контейнеров (CLI) в distroless-образах.
 	case "idle":
 		select {}
+
+	// wait-for <host:port> [--timeout=120s] [--interval=2s]
+	// Заменяет "while ! nc -z host port; do sleep 1; done" в init-контейнерах.
+	// Пример: ozone wait-for scm:9894 --timeout=180s
+	case "wait-for":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: ozone wait-for <host:port> [--timeout=120s] [--interval=2s]")
+			os.Exit(1)
+		}
+		addr := os.Args[2]
+		timeout := 120 * time.Second
+		interval := 2 * time.Second
+		for _, arg := range os.Args[3:] {
+			var val string
+			if strings.HasPrefix(arg, "--timeout=") {
+				val = strings.TrimPrefix(arg, "--timeout=")
+				if d, err := time.ParseDuration(val); err == nil {
+					timeout = d
+				}
+			} else if strings.HasPrefix(arg, "--interval=") {
+				val = strings.TrimPrefix(arg, "--interval=")
+				if d, err := time.ParseDuration(val); err == nil {
+					interval = d
+				}
+			}
+		}
+		if err := waitFor(addr, timeout, interval); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 
 	// scm-start — полная последовательность запуска SCM без shell:
 	//   1. Только на примордиальном узле (POD_NAME оканчивается на "-0-0"):
@@ -233,7 +284,7 @@ func main() {
 		mainClass, ok := commands[command]
 		if !ok {
 			fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
-			fmt.Fprintln(os.Stderr, "Available commands: datanode, om, scm, s3g, recon, scm-start, om-start, idle")
+			fmt.Fprintln(os.Stderr, "Available commands: datanode, om, scm, s3g, recon, scm-start, om-start, idle, wait-for")
 			os.Exit(1)
 		}
 		classpath := buildClasspath(command)
