@@ -134,6 +134,21 @@ for sofile in \
     done
 done
 
+# ── 5. C++ runtime (libstdc++, libgcc_s) ─────────────────────────────────────
+# RocksDB извлекает нативную .so из JAR в /tmp и грузит через dlopen.
+# ldd java её не видит, поэтому копируем явно.
+echo ">>> C++ runtime libraries"
+for cpplib in \
+    /lib64/libstdc++.so* /usr/lib64/libstdc++.so* /usr/lib/libstdc++.so* \
+    /lib64/libgcc_s.so*  /usr/lib64/libgcc_s.so*  /usr/lib/libgcc_s.so*; do
+    [ -f "$cpplib" ] || continue
+    copy_file "$cpplib"
+    ldd "$cpplib" 2>/dev/null | awk '/=>/ {print $3}' | while read -r lib; do
+        [ -f "$lib" ] || continue
+        copy_file "$lib"
+    done
+done
+
 # ── 5. Kerberos / GSSAPI ─────────────────────────────────────────────────────
 # Hadoop использует libgssapi_krb5.so через JNI для Kerberos-аутентификации.
 # Копируем все krb5/gssapi .so и их транзитивные зависимости.
