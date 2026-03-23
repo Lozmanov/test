@@ -1,0 +1,198 @@
+{{- if and .Values.istio.enabled .Values.istio.sidecar.enabled }}
+
+{{/*
+  Egress communication graph:
+
+  SCM       → SCM (Raft), OM (cert/coordination)
+  OM        → OM (Raft), SCM (coordination)
+  DataNode  → SCM (heartbeat/block-report), OM (registration), DataNode (replication)
+  Recon     → SCM, OM, DataNode (passive polling)
+  S3G       → OM (metadata), DataNode (data I/O)
+  CLI       → OM, SCM, DataNode, S3G-rest (admin ops)
+  HUE       → OM (wait-for + API), S3G-rest (S3 API), ext-PostgreSQL
+  HiveMeta  → OM (OFS filesystem), ext-PostgreSQL
+
+  hosts format: "<namespace>/<fqdn>" per Istio Sidecar spec.
+  Kubernetes services use FQDN: <svc>.<ns>.svc.<clusterDomain>
+  External services (ServiceEntry) use the hostname from the ServiceEntry.hosts field.
+*/}}
+
+{{- $ns  := include "ozone.namespace" . }}
+{{- $dom := .Values.global.clusterDomain }}
+
+{{- if .Values.scm.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-scm
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.scm.component }}
+  egress:
+    - hosts:
+        # Service hostname (used by initContainers wait-for and clients)
+        - "./{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        # Pod FQDNs via headless service (used for Raft peer-to-peer): scm-N-0.scm.*
+        - "./*.{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./*.{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+{{- end }}
+
+{{- if .Values.om.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-om
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.om.component }}
+  egress:
+    - hosts:
+        # Service hostname
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        # Pod FQDNs via headless service (Raft peer-to-peer): om-N-0.om.*
+        - "./*.{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./*.{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+{{- end }}
+
+{{- if .Values.datanode.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-datanode
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.datanode.component }}
+  egress:
+    - hosts:
+        - "./{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./*.{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./*.{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        # Pod FQDNs for DataNode peer replication: datanode-N-0.datanode.*
+        - "./{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./*.{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+{{- end }}
+
+{{- if .Values.recon.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-recon
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.recon.component }}
+  egress:
+    - hosts:
+        - "./{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+{{- end }}
+
+{{- if .Values.s3g.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-s3g
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.s3g.component }}
+  egress:
+    - hosts:
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+{{- end }}
+
+{{- if .Values.cli.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-cli
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.cli.component }}
+  egress:
+    - hosts:
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.s3g.serviceName }}-rest.{{ $ns }}.svc.{{ $dom }}"
+{{- end }}
+
+{{- if .Values.hue.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-hue
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.hue.component }}
+  egress:
+    - hosts:
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.s3g.serviceName }}-rest.{{ $ns }}.svc.{{ $dom }}"
+        {{- if .Values.hue.database.host }}
+        # External PostgreSQL — must match ServiceEntry.hosts (synthetic name for IPs)
+        - "./{{ include "ozone.externalDbHost" .Values.hue.database.host }}"
+        {{- end }}
+{{- end }}
+
+{{- if .Values.hiveMetastore.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-hivemetastore
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.hiveMetastore.component }}
+  egress:
+    - hosts:
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        {{- if .Values.hiveMetastore.database.host }}
+        # External PostgreSQL — must match ServiceEntry.hosts (synthetic name for IPs)
+        - "./{{ include "ozone.externalDbHost" .Values.hiveMetastore.database.host }}"
+        {{- end }}
+{{- end }}
+
+{{- end }}

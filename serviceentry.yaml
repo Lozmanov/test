@@ -1,0 +1,48 @@
+{{- if .Values.istio.enabled }}
+{{- /*
+  Collect unique external PostgreSQL endpoints from all enabled services.
+  Key format "<host>_<port>" ensures that if HUE and HiveMetastore share the
+  same PostgreSQL instance, only a single ServiceEntry is rendered.
+*/ -}}
+{{- $endpoints := dict }}
+{{- if and .Values.hue.enabled .Values.hue.database.host }}
+  {{- $key := printf "%s_%v" .Values.hue.database.host .Values.hue.database.port }}
+  {{- $_ := set $endpoints $key (dict "host" .Values.hue.database.host "port" (int .Values.hue.database.port)) }}
+{{- end }}
+{{- if and .Values.hiveMetastore.enabled .Values.hiveMetastore.database.host }}
+  {{- $key := printf "%s_%v" .Values.hiveMetastore.database.host .Values.hiveMetastore.database.port }}
+  {{- $_ := set $endpoints $key (dict "host" .Values.hiveMetastore.database.host "port" (int .Values.hiveMetastore.database.port)) }}
+{{- end }}
+{{- range $key, $ep := $endpoints }}
+{{- $seHost := include "ozone.externalDbHost" $ep.host }}
+{{- $isIP   := regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" $ep.host }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: {{ include "ozone.fullname" $ }}-ext-{{ $ep.host | replace "." "-" | replace "_" "-" | lower | trunc 40 | trimSuffix "-" }}
+  namespace: {{ include "ozone.namespace" $ }}
+  labels:
+    {{- include "ozone.labels" $ | nindent 4 }}
+spec:
+  hosts:
+    - {{ $seHost | quote }}
+  {{- if $isIP }}
+  addresses:
+    - {{ $ep.host | quote }}
+  {{- end }}
+  ports:
+    - number: {{ $ep.port }}
+      name: tcp-postgresql
+      protocol: TCP
+  {{- if $isIP }}
+  resolution: STATIC
+  location: MESH_EXTERNAL
+  endpoints:
+    - address: {{ $ep.host | quote }}
+  {{- else }}
+  resolution: DNS
+  location: MESH_EXTERNAL
+  {{- end }}
+{{- end }}
+{{- end }}
