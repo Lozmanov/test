@@ -1,0 +1,71 @@
+{{- if .Values.istio.enabled }}
+{{/*
+  Patch inbound Envoy clusters for OM pods to use ORIGINAL_DST routing.
+
+  Problem: In HA mode, OzoneManager.startRpcServer() resolves the per-node FQDN
+  (ozone.om.address.<serviceId>.<nodeId>) to the pod IP and binds the RPC/Ratis
+  servers there. Istio's default REDIRECT interception mode rewrites inbound
+  connections to 127.0.0.1, causing ECONNREFUSED because the app is not on
+  loopback.
+
+  Fix: Change the inbound Envoy cluster type to ORIGINAL_DST. With iptables
+  REDIRECT, SO_ORIGINAL_DST carries the real pod IP:port. Envoy then connects
+  to that address (as UID 1337, which is excluded from iptables interception),
+  so the packet reaches the OM process without looping.
+
+  This does not require TPROXY or NET_ADMIN; it works with the default
+  REDIRECT interception mode and any security context.
+*/}}
+
+{{- if .Values.om.enabled }}
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: {{ include "ozone.fullname" . }}-om-inbound-original-dst
+  namespace: {{ include "ozone.namespace" . }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.om.component }}
+  configPatches:
+    # RPC port — Hadoop IPC, used by all Ozone clients (DataNode, S3G, CLI …)
+    - applyTo: CLUSTER
+      match:
+        context: SIDECAR_INBOUND
+        cluster:
+          portNumber: {{ .Values.om.service.rpcPort }}
+      patch:
+        operation: MERGE
+        value:
+          type: ORIGINAL_DST
+          lbPolicy: CLUSTER_PROVIDED
+
+    # Ratis port — Raft replication between OM peers; also binds to pod IP
+    - applyTo: CLUSTER
+      match:
+        context: SIDECAR_INBOUND
+        cluster:
+          portNumber: {{ .Values.om.service.ratisPort }}
+      patch:
+        operation: MERGE
+        value:
+          type: ORIGINAL_DST
+          lbPolicy: CLUSTER_PROVIDED
+
+    # HTTP port — Prometheus metrics / web UI; also binds to pod IP
+    - applyTo: CLUSTER
+      match:
+        context: SIDECAR_INBOUND
+        cluster:
+          portNumber: {{ .Values.om.service.port }}
+      patch:
+        operation: MERGE
+        value:
+          type: ORIGINAL_DST
+          lbPolicy: CLUSTER_PROVIDED
+{{- end }}
+
+{{- end }}
