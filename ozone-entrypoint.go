@@ -84,11 +84,16 @@ func buildClasspath(command string) string {
 		}
 	}
 
-	// Добавляем опциональные JAR-ы из lib/<artifact>/ (аналог OPTIONAL_CLASSPATH_DIR в shell).
-	// Например, lib/ozone-manager/ содержит Ranger plugin JARs.
-	// Намеренно НЕ делаем glob lib/*.jar — он подтягивал бы лишние JARы (например jersey-server 1.x),
-	// которых нет в .classpath файле и которые ломают CDI-инициализацию Weld в s3g.
+	// Добавляем main artifact JAR (аналог шага в ozone_assemble_classpath).
+	// Он не включён в собственный .classpath файл, поэтому добавляем явно.
+	// Например: lib/ozone-s3gateway-*.jar, lib/ozone-manager-*.jar и т.д.
 	if artifact, ok := artifactNames[command]; ok {
+		mainJars, _ := filepath.Glob(libDir + "/" + artifact + "-*.jar")
+		for _, j := range mainJars {
+			add(j)
+		}
+		// Добавляем опциональные JAR-ы из lib/<artifact>/ (аналог OPTIONAL_CLASSPATH_DIR в shell).
+		// Например, lib/ozone-manager/ содержит Ranger plugin JARs.
 		optJars, _ := filepath.Glob(libDir + "/" + artifact + "/*.jar")
 		for _, j := range optJars {
 			add(j)
