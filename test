@@ -1,0 +1,90 @@
+Шаблон templates/resourcequota.yaml:                                                                                                                                                                                                                  
+  {{- if and .Values.resourceQuota.enabled (eq .Values.global.storage.mode "storageClass") }}                                                                                                                                                           
+  {{- $dnDisks := len .Values.global.storage.storageClass.datanode.diskIndices | int }}                                                                                                                                                                 
+  {{- $pvcCount := add                                                                 
+      (mul (.Values.om.replicas | int) 1)                                                                                                                                                                                                               
+      (mul (.Values.scm.replicas | int) 1)
+      (mul (.Values.datanode.replicas | int) $dnDisks) }}                                                                                                                                                                                               
+  {{- $quota := .Values.resourceQuota.extraPVCs | int | add $pvcCount }}                                                                                                                                                                                
+  apiVersion: v1                                                        
+  kind: ResourceQuota                                                                                                                                                                                                                                   
+  metadata:          
+    name: {{ include "ozone.fullname" . }}-storage                                                                                                                                                                                                      
+    namespace: {{ include "ozone.namespace" . }}  
+    labels:                                                                                                                                                                                                                                             
+      {{- include "ozone.labels" . | nindent 4 }}
+  spec:                                                                                                                                                                                                                                                 
+    hard:         
+      persistentvolumeclaims: "{{ $quota }}"
+  {{- end }}
+                                                                                                                                                                                                                                                        
+  В values:
+  resourceQuota:                                                                                                                                                                                                                                        
+    enabled: false
+    # Extra PVCs beyond what the chart itself creates (e.g. for pre-existing claims)
+    extraPVCs: 0          
+
+
+
+SCMNodeManager.java:376-383:                                                                                                                                                                                                                          
+  InetAddress dnAddress = Server.getRemoteIp();                                                                                                                                                                                                         
+  if (dnAddress != null) {                     
+      if (!useHostname) {                                                                                                                                                                                                                               
+          datanodeDetails.setHostName(dnAddress.getHostName());                                                                                                                                                                                         
+      }                                                                                                                                                                                                                                                 
+      datanodeDetails.setIpAddress(dnAddress.getHostAddress());  // ← вот оно
+  }                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                        
+  SCM всегда безусловно перезаписывает IP DataNode на Server.getRemoteIp() — т.е. IP входящего TCP-соединения. При Istio RPC-вызов DataNode→SCM:9861 перехватывается Envoy, и соединение до SCM приходит с 127.0.0.1. Именно поэтому:
+                                                                                                                                                                                                                                                        
+  - hdds.datanode.dns.interface: eth0 в чарте не помогает — DataNode правильно отправляет свой IP, но SCM его тут же выбрасывает                                                                                                                        
+  - Более того, в чарте ещё и неправильное имя параметра: hdds.datanode.dns.interface — не существует. Правильный ключ: dfs.datanode.dns.interface (см. DFSConfigKeysLegacy.DFS_DATANODE_DNS_INTERFACE_KEY)                                             
+                                                                                                                                                                                                                                                        
+  ---             
+  Решение в исходниках Ozone                                                                                                                                                                                                                            
+                            
+  Добавить новый конфиг-параметр в SCMNodeManager, который отключает перезапись IP из TCP-соединения:
+                                                                                                                                                                                                                                                        
+  SCMNodeManager.java — конструктор:
+  this.useRemoteAddress = conf.getBoolean(                                                                                                                                                                                                              
+      ScmConfigKeys.OZONE_SCM_DATANODE_REGISTRATION_USE_REMOTE_ADDRESS,
+      ScmConfigKeys.OZONE_SCM_DATANODE_REGISTRATION_USE_REMOTE_ADDRESS_DEFAULT);                                                                                                                                                                        
+  // default: true — для обратной совместимости                                 
+                                                                                                                                                                                                                                                        
+  SCMNodeManager.java — метод register():
+  InetAddress dnAddress = Server.getRemoteIp();                                                                                                                                                                                                         
+  if (dnAddress != null && useRemoteAddress) { 
+      if (!useHostname) {                                                                                                                                                                                                                               
+          datanodeDetails.setHostName(dnAddress.getHostName());                                                                                                                                                                                         
+      }                                                        
+      datanodeDetails.setIpAddress(dnAddress.getHostAddress());                                                                                                                                                                                         
+  }                                                            
+   
+  ScmConfigKeys.java:
+  public static final String OZONE_SCM_DATANODE_REGISTRATION_USE_REMOTE_ADDRESS =                                                                                                                                                                       
+      "hdds.scm.datanode.registration.use.remote.address";                       
+  public static final boolean OZONE_SCM_DATANODE_REGISTRATION_USE_REMOTE_ADDRESS_DEFAULT = true;                                                                                                                                                        
+                                                                                                
+  ---                                                                                                                                                                                                                                                   
+  Изменения в helm chart                                                                                                                                                                                                                                
+                        
+  В ozone-site.xml в values.yaml:                                                                                                                                                                                                                       
+                                                                                                                                                                                                                                                        
+  1. Исправить неправильный параметр (hdds.datanode.dns.interface → dfs.datanode.dns.interface) — хотя при новом параметре SCM он уже не нужен                                                                                                          
+  2. Добавить новый параметр (условно, при istio.enabled):                                                                                                                                                                                              
+                                                                                                                                                                                                                                                        
+  {{- if .Values.istio.enabled }}
+  <property>                                                                                                                                                                                                                                            
+    <name>hdds.scm.datanode.registration.use.remote.address</name>
+    <value>false</value>                                                                                                                                                                                                                                
+    <description>
+      When false, SCM trusts the IP address self-reported by the DataNode                                                                                                                                                                               
+      instead of overriding it with the TCP remote address.                                                                                                                                                                                             
+      Required when Istio sidecar is injected: Envoy proxies the                                                                                                                                                                                        
+      DataNode→SCM RPC connection from 127.0.0.1, causing Server.getRemoteIp()                                                                                                                                                                          
+      to return 127.0.0.1 which SCM then registers as the DataNode address.                                                                                                                                                                             
+    </description>                                                                                                                                                                                                                                      
+  </property>                                                                                                                                                                                                                                           
+  {{- end }}                                                                                                                                                                                                                                            
+
+
