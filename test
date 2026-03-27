@@ -1,52 +1,16 @@
-Write(docker/hue-entrypoint.go)                                                                                                                                                                                                                       
-  ⎿  Added 9 lines, removed 4 lines                         
-      17      log.Fatalf("chdir %s: %v", hueHome, err)                                                                                                                                                                                                  
-      18    }
-      19                                                                                                                                                                                                                                                
-      20 -  migrate := exec.Command(hueHome+"/build/env/bin/hue", "migrate")                                                                                                                                                                     
-      20 +  python := hueHome + "/build/env/bin/python"                                                                                                                                                                                          
-      21 +  hueScript := hueHome + "/build/env/bin/hue"                                                                                                                                                                                          
-      22 +  supervisorScript := hueHome + "/build/env/bin/supervisor"                                                                                                                                                                            
-      23 +                                                                                                                                                                                                                                       
-      24 +  // Вызываем Python явно, не через shebang — в scratch shebang-резолюция                                                                                                                                                              
-      25 +  // ненадёжна: ядро возвращает ENOENT если интерпретатор не найден.                                                                                                                                                                   
-      26 +  migrate := exec.Command(python, hueScript, "migrate")                                                                                                                                                                                
-      27    migrate.Stdout = os.Stdout
-      28    migrate.Stderr = os.Stderr
-      29    migrate.Stdin = os.Stdin
-     ...
-      31      log.Printf("warning: hue migrate: %v", err)
-      32    }
-      33  
-      28 -  supervisor := hueHome + "/build/env/bin/supervisor"                                                                                                                                                                                  
-      29 -  if err := syscall.Exec(supervisor, []string{supervisor}, os.Environ()); err != nil {                                                                                                                                                 
-      30 -    log.Fatalf("exec %s: %v", supervisor, err)                                                                                                                                                                                         
-      34 +  if err := syscall.Exec(python, []string{python, supervisorScript}, os.Environ()); err != nil {                                                                                                                                       
-      35 +    log.Fatalf("exec supervisor: %v", err)                                                                                                                                                                                             
-      36    }
-      37  }
+echo ">>> /usr/bin/env"
+copy_with_deps /usr/bin/env
+mkdir -p "${ROOTFS}/usr/bin"
+[ -e "${ROOTFS}/usr/bin/env" ] || ln -sf "$(readlink -f /usr/bin/env)" "${ROOTFS}/usr/bin/env"
 
-● Теперь добавляю явное копирование dynamic linker в collect-deps.sh — без него execve ELF-бинаря тоже вернёт ENOENT:
 
-  Read 1 file (ctrl+o to expand)                                                                                                                                                                                                                        
-                           
-● Update(docker/collect-deps.sh)                                                                                                                                                                                                                        
-  ⎿  Added 12 lines                                         
-      39      done                                                                                                                                                                                                                                      
-      40  }                                                                                                                                                                                                                                             
-      41                                                                                                                                                                                                                                                
-      42 +# ── 0. Dynamic linker — обязателен для запуска любого ELF-бинаря ─────────────                                                                                                                                                               
-      43 +# Без него execve возвращает ENOENT даже если бинарь существует.                                                                                                                                                                       
-      44 +echo ">>> Dynamic linker"                                                                                                                                                                                                              
-      45 +for ldso in \                                                                                                                                                                                                                          
-      46 +    /lib64/ld-linux-x86-64.so.2 \                                                                                                                                                                                                      
-      47 +    /lib/ld-linux-x86-64.so.2 \                                                                                                                                                                                                        
-      48 +    /lib64/ld-linux-aarch64.so.1 \                                                                                                                                                                                                     
-      49 +    /lib/ld-linux-aarch64.so.1; do                                                                                                                                                                                                     
-      50 +    [ -f "$ldso" ] || [ -L "$ldso" ] || continue                                                                                                                                                                                       
-      51 +    copy_file "$ldso"                                                                                                                                                                                                                  
-      52 +done                                                                                                                                                                                                                                   
-      53 +                                                                                                                                                                                                                                       
-      54  # ── 1. Python binary ──────────────────────────────────────────────────────────
-      55  echo ">>> Python binary"
-      56  PYTHON_BIN="$(readlink -f "$(command -v python2.7 2>/dev/null || command -v python2 2>/dev/null || command -v python)")"
+
+RUN python2 -c "
+path = '${HUE_HOME}/desktop/core/src/desktop/lib/conf.py'
+src = open(path).read()
+old = 'def coerce_password_from_script(raw):'
+new = 'def coerce_password_from_script(raw):\n  if not raw or not raw.strip():\n    return \"\"'
+assert old in src, 'patch target not found in ' + path
+open(path, 'w').write(src.replace(old, new, 1))
+print('patched: ' + path)
+"
