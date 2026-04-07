@@ -1,16 +1,33 @@
-echo ">>> /usr/bin/env"
-copy_with_deps /usr/bin/env
-mkdir -p "${ROOTFS}/usr/bin"
-[ -e "${ROOTFS}/usr/bin/env" ] || ln -sf "$(readlink -f /usr/bin/env)" "${ROOTFS}/usr/bin/env"
+def createBucketAndGetS3Secret() {
+    withCredentials([string(credentialsId: "$tokenCred", variable: 'token')]) {
+        sh "oc login --token=${token} --server=$clusterURL"
+        sh "oc project $params.OS_PROJECT"
 
+        def cliPod = sh(
+            script: "oc get pod -l component=cli -o jsonpath='{.items[0].metadata.name}'",
+            returnStdout: true
+        ).trim()
+        echo "CLI pod: ${cliPod}"
 
+        // Создаём S3-volume (s3v — дефолтный volume для S3 в Ozone), игнорируем ошибку если уже существует
+        sh "oc exec ${cliPod} -- ozone sh volume create /s3v || true"
 
-RUN python2 -c "
-path = '${HUE_HOME}/desktop/core/src/desktop/lib/conf.py'
-src = open(path).read()
-old = 'def coerce_password_from_script(raw):'
-new = 'def coerce_password_from_script(raw):\n  if not raw or not raw.strip():\n    return \"\"'
-assert old in src, 'patch target not found in ' + path
-open(path, 'w').write(src.replace(old, new, 1))
-print('patched: ' + path)
-"
+        // Создаём бакет
+        sh "oc exec ${cliPod} -- ozone sh bucket create /s3v/${params.BUCKET_NAME}"
+
+        // Получаем S3-секрет для подключения
+        def s3Secret = sh(
+            script: "oc exec ${cliPod} -- ozone s3 getsecret",
+            returnStdout: true
+        ).trim()
+
+        writeFile file: 'bucket-info.txt', text: """\
+Bucket created: /s3v/${params.BUCKET_NAME}
+Namespace:      ${params.OS_PROJECT}
+Cluster:        ${clusterURL}
+"""
+        writeFile file: 's3-credentials.txt', text: s3Secret
+
+        archiveArtifacts artifacts: 'bucket-info.txt, s3-credentials.txt', fingerprint: true
+    }
+}
