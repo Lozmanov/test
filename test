@@ -1,7 +1,14 @@
-def createBucketAndGetS3Secret() {
+def waitForOzoneReady() {
     withCredentials([string(credentialsId: "$tokenCred", variable: 'token')]) {
         sh "oc login --token=${token} --server=$clusterURL"
         sh "oc project $params.OS_PROJECT"
+
+        // Ждём Ready для всех критичных компонентов (таймаут 5 мин на каждый)
+        sh "oc wait pod -l component=om       --for=condition=Ready --timeout=300s"
+        sh "oc wait pod -l component=scm      --for=condition=Ready --timeout=300s"
+        sh "oc wait pod -l component=datanode --for=condition=Ready --timeout=300s"
+        sh "oc wait pod -l component=s3g      --for=condition=Ready --timeout=300s"
+        sh "oc wait pod -l component=cli      --for=condition=Ready --timeout=300s"
 
         def cliPod = sh(
             script: "oc get pod -l component=cli -o jsonpath='{.items[0].metadata.name}'",
@@ -9,25 +16,39 @@ def createBucketAndGetS3Secret() {
         ).trim()
         echo "CLI pod: ${cliPod}"
 
-        // Создаём S3-volume (s3v — дефолтный volume для S3 в Ozone), игнорируем ошибку если уже существует
-        sh "oc exec ${cliPod} -- ozone sh volume create /s3v || true"
-
-        // Создаём бакет
-        sh "oc exec ${cliPod} -- ozone sh bucket create /s3v/${params.BUCKET_NAME}"
-
-        // Получаем S3-секрет для подключения
-        def s3Secret = sh(
-            script: "oc exec ${cliPod} -- ozone s3 getsecret",
-            returnStdout: true
-        ).trim()
-
-        writeFile file: 'bucket-info.txt', text: """\
-Bucket created: /s3v/${params.BUCKET_NAME}
-Namespace:      ${params.OS_PROJECT}
-Cluster:        ${clusterURL}
-"""
-        writeFile file: 's3-credentials.txt', text: s3Secret
-
-        archiveArtifacts artifacts: 'bucket-info.txt, s3-credentials.txt', fingerprint: true
+        // Поллим safemode — кластер считается готовым когда safemode OFF
+        // Попытки каждые 15 сек, максимум 10 минут (40 попыток)
+        def maxRetries = 40
+        def ready = false
+        for (int i = 0; i < maxRetries; i++) {
+            def status = sh(
+                script: "oc exec ${cliPod} -- ozone admin safemode status 2>&1 || true",
+                returnStdout: true
+            ).trim()
+            echo "Safemode status [${i + 1}/${maxRetries}]: ${status}"
+            if (status.contains('Safemode is OFF')) {
+                ready = true
+                break
+            }
+            if (i < maxRetries - 1) {
+                sleep(time: 15, unit: 'SECONDS')
+            }
+        }
+        if (!ready) {
+            error("Ozone не вышел из safe mode в течение отведённого времени")
+        }
     }
 }
+
+
+stage('Wait for Ozone Ready') {
+            when {
+                expression { params.ACTION == 'INSTALL_OZONE' }
+            }
+            steps {
+                script {
+                    echo "Waiting for all Ozone components to be ready"
+                    funclib.waitForOzoneReady()
+                }
+            }
+        }
