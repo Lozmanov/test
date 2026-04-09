@@ -52,3 +52,33 @@ stage('Wait for Ozone Ready') {
                 }
             }
         }
+
+
+
+values.yaml:
+  datanode:
+    externalIPs:
+      - "10.0.1.10"
+      - "10.0.1.11"
+      - "10.0.1.12"
+    om:
+      externalIP: "10.0.1.9"
+
+
+  templates/datanode/service-external.yaml
+    metadata:
+      annotations:
+        metallb.universe.tf/loadBalancerIPs: {{ index .externalIPs $i }}
+    spec:
+      type: LoadBalancer
+      selector:
+        statefulset.kubernetes.io/pod-name: datanode-{{ $i }}-0
+      ports: [9870]
+
+  statefulset.yaml
+    OZONE_OPTS: "... -Dhdds.datanode.client.address={{ index .externalIPs $i }}:9870"
+
+  templates/om/service-external.yaml
+    metallb.universe.tf/loadBalancerIPs: {{ .om.externalIP }}
+    type: LoadBalancer
+    ports: [9862]
