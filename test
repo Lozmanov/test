@@ -1,155 +1,52 @@
-#!/usr/bin/env bash
-# collect-logs.sh — collect Ozone + Istio logs for incident analysis.
-#
-# Usage:
-#   ./collect-logs.sh [NAMESPACE]
-#
-# NAMESPACE defaults to "ozone".
-# Output: ./ozone-logs-<namespace>-<timestamp>.tar.gz
+{{- if .Values.istio.enabled }}
+{{- $ns := include "ozone.namespace" . }}
 
-set -euo pipefail
+{{/*
+  EnvoyFilter: raise TCP idle_timeout on the OM upstream cluster inside S3G pods.
 
-NS="${1:-ozone}"
-TS=$(date +%Y%m%d_%H%M%S)
-OUT_DIR="ozone-logs-${NS}-${TS}"
+  Root cause: Envoy treats OM port 9862 (Hadoop IPC / raw TCP) as an opaque
+  TCP passthrough cluster.  The default Envoy TCP idle_timeout for such
+  clusters is 10 s.  During large multipart uploads S3G keeps a long-lived IPC
+  connection to OM; when OM is waiting for SCM/Ratis consensus (AllocateBlock),
+  no bytes flow for > 10 s and Envoy silently tears down the TCP connection.
+  S3G then receives a connection reset on the outstanding RPC call.
 
-echo "==> Collecting logs from namespace: ${NS}"
-echo "==> Output directory: ${OUT_DIR}"
-mkdir -p "${OUT_DIR}"
+  This filter targets the S3G pod and patches every cluster whose name
+  contains the OM service hostname on port 9862, setting idle_timeout to 1 h.
+  All other pods and clusters are unaffected.
+*/}}
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+{{- if .Values.s3g.enabled }}
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: {{ include "ozone.fullname" . }}-om-tcp-idle
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  # Apply only to S3G pods — they are the ones opening outbound IPC to OM.
+  workloadSelector:
+    labels:
+      component: {{ .Values.s3g.component }}
+  configPatches:
+    - applyTo: CLUSTER
+      match:
+        context: SIDECAR_OUTBOUND
+        cluster:
+          portNumber: {{ .Values.om.service.rpcPort }}
+      patch:
+        operation: MERGE
+        value:
+          upstream_connection_options:
+            tcp_keepalive:
+              keepalive_time: 60
+              keepalive_interval: 10
+              keepalive_probes: 3
+          # 1 hour — well beyond any OM Ratis round-trip.
+          # 0 would disable the timeout entirely.
+          idle_timeout: 3600s
+{{- end }}
 
-log() { echo "[$(date +%H:%M:%S)] $*"; }
-
-dump() {
-  local file="$1"; shift
-  mkdir -p "$(dirname "${OUT_DIR}/${file}")"
-  "$@" > "${OUT_DIR}/${file}" 2>&1 || true
-}
-
-pod_logs() {
-  local pod="$1"
-  local container="$2"
-  local label="$3"
-  dump "pods/${pod}/${label}.log" \
-    kubectl logs -n "${NS}" "${pod}" -c "${container}" --tail=5000
-  # Previous container if it crashed/restarted
-  dump "pods/${pod}/${label}.previous.log" \
-    kubectl logs -n "${NS}" "${pod}" -c "${container}" --tail=2000 --previous
-}
-
-# ── Cluster state ────────────────────────────────────────────────────────────
-
-log "Collecting cluster state..."
-dump "cluster/pods.txt"        kubectl get pods       -n "${NS}" -o wide
-dump "cluster/pods-yaml.yaml"  kubectl get pods       -n "${NS}" -o yaml
-dump "cluster/services.txt"    kubectl get svc        -n "${NS}" -o wide
-dump "cluster/ingresses.txt"   kubectl get ingress    -n "${NS}" -o wide
-dump "cluster/events.txt"      kubectl get events     -n "${NS}" --sort-by='.lastTimestamp'
-dump "cluster/configmaps.txt"  kubectl get cm         -n "${NS}" -o yaml
-dump "cluster/top-pods.txt"    kubectl top pods       -n "${NS}"
-dump "cluster/top-nodes.txt"   kubectl top nodes
-
-# ── Pod descriptions ─────────────────────────────────────────────────────────
-
-log "Describing pods..."
-for pod in $(kubectl get pods -n "${NS}" -o jsonpath='{.items[*].metadata.name}'); do
-  dump "pods/${pod}/describe.txt" kubectl describe pod -n "${NS}" "${pod}"
-done
-
-# ── Ozone app + Istio sidecar logs ───────────────────────────────────────────
-
-log "Collecting pod logs..."
-for pod in $(kubectl get pods -n "${NS}" -o jsonpath='{.items[*].metadata.name}'); do
-  # Determine app container name (first non-istio-proxy container)
-  containers=$(kubectl get pod -n "${NS}" "${pod}" \
-    -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || true)
-
-  for c in ${containers}; do
-    if [[ "${c}" == "istio-proxy" ]]; then
-      log "  ${pod} / istio-proxy"
-      pod_logs "${pod}" "istio-proxy" "istio-proxy"
-    else
-      log "  ${pod} / ${c}"
-      pod_logs "${pod}" "${c}" "${c}"
-    fi
-  done
-
-  # Init containers (e.g. istio-init)
-  init_containers=$(kubectl get pod -n "${NS}" "${pod}" \
-    -o jsonpath='{.spec.initContainers[*].name}' 2>/dev/null || true)
-  for c in ${init_containers}; do
-    dump "pods/${pod}/init-${c}.log" \
-      kubectl logs -n "${NS}" "${pod}" -c "${c}" --tail=500 || true
-  done
-done
-
-# ── Istio proxy stats & config ───────────────────────────────────────────────
-
-ISTIOCTL=$(command -v istioctl 2>/dev/null || \
-  find . /usr/local/bin /usr/bin -name istioctl 2>/dev/null | head -1 || true)
-
-if [[ -n "${ISTIOCTL}" ]]; then
-  log "istioctl found: ${ISTIOCTL}"
-
-  for pod in $(kubectl get pods -n "${NS}" \
-    -o jsonpath='{.items[?(@.spec.containers[*].name=="istio-proxy")].metadata.name}'); do
-
-    log "  Istio proxy-status: ${pod}"
-    dump "istio/proxy-status/${pod}.txt" \
-      "${ISTIOCTL}" proxy-status "${pod}.${NS}"
-
-    log "  Istio proxy-config cluster: ${pod}"
-    dump "istio/proxy-config/${pod}/clusters.txt" \
-      "${ISTIOCTL}" proxy-config cluster "${pod}.${NS}"
-
-    log "  Istio proxy-config listener: ${pod}"
-    dump "istio/proxy-config/${pod}/listeners.txt" \
-      "${ISTIOCTL}" proxy-config listener "${pod}.${NS}"
-
-    log "  Istio proxy-config route: ${pod}"
-    dump "istio/proxy-config/${pod}/routes.txt" \
-      "${ISTIOCTL}" proxy-config route "${pod}.${NS}"
-
-    log "  Istio proxy-config endpoint: ${pod}"
-    dump "istio/proxy-config/${pod}/endpoints.txt" \
-      "${ISTIOCTL}" proxy-config endpoint "${pod}.${NS}"
-
-    log "  Envoy stats: ${pod}"
-    dump "istio/envoy-stats/${pod}.txt" \
-      "${ISTIOCTL}" experimental envoy-stats "${pod}.${NS}"
-  done
-
-  log "  Istio analyze"
-  dump "istio/analyze.txt" "${ISTIOCTL}" analyze -n "${NS}"
-else
-  log "istioctl not found — skipping proxy-config dumps"
-fi
-
-# ── Istio CRDs in namespace ──────────────────────────────────────────────────
-
-log "Collecting Istio CRDs..."
-for kind in destinationrule virtualservice sidecar \
-            peerauthentication authorizationpolicy serviceentry; do
-  dump "istio/crds/${kind}.yaml" \
-    kubectl get "${kind}" -n "${NS}" -o yaml 2>/dev/null || true
-done
-
-# ── istiod logs ──────────────────────────────────────────────────────────────
-
-log "Collecting istiod logs..."
-for pod in $(kubectl get pods -n istio-system \
-  -l app=istiod -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-  dump "istio/istiod/${pod}.log" \
-    kubectl logs -n istio-system "${pod}" --tail=2000
-done
-
-# ── Archive ──────────────────────────────────────────────────────────────────
-
-ARCHIVE="${OUT_DIR}.tar.gz"
-tar -czf "${ARCHIVE}" "${OUT_DIR}"
-rm -rf "${OUT_DIR}"
-
-echo ""
-echo "==> Done: ${ARCHIVE}"
-echo "    $(du -sh "${ARCHIVE}" | cut -f1)"
+{{- end }}
