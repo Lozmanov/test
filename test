@@ -1,9 +1,155 @@
-{{- $nodeName := "" }}
-{{- if and $.Values.datanode.nodeHostnames (gt (len $.Values.datanode.nodeHostnames) $i) }}
-{{- $nodeName = index $.Values.datanode.nodeHostnames $i }}
-{{- end }}
+#!/usr/bin/env bash
+# collect-logs.sh — collect Ozone + Istio logs for incident analysis.
+#
+# Usage:
+#   ./collect-logs.sh [NAMESPACE]
+#
+# NAMESPACE defaults to "ozone".
+# Output: ./ozone-logs-<namespace>-<timestamp>.tar.gz
 
+set -euo pipefail
 
-{{- if $nodeName }}
-{{- end }}
+NS="${1:-ozone}"
+TS=$(date +%Y%m%d_%H%M%S)
+OUT_DIR="ozone-logs-${NS}-${TS}"
 
+echo "==> Collecting logs from namespace: ${NS}"
+echo "==> Output directory: ${OUT_DIR}"
+mkdir -p "${OUT_DIR}"
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+log() { echo "[$(date +%H:%M:%S)] $*"; }
+
+dump() {
+  local file="$1"; shift
+  mkdir -p "$(dirname "${OUT_DIR}/${file}")"
+  "$@" > "${OUT_DIR}/${file}" 2>&1 || true
+}
+
+pod_logs() {
+  local pod="$1"
+  local container="$2"
+  local label="$3"
+  dump "pods/${pod}/${label}.log" \
+    kubectl logs -n "${NS}" "${pod}" -c "${container}" --tail=5000
+  # Previous container if it crashed/restarted
+  dump "pods/${pod}/${label}.previous.log" \
+    kubectl logs -n "${NS}" "${pod}" -c "${container}" --tail=2000 --previous
+}
+
+# ── Cluster state ────────────────────────────────────────────────────────────
+
+log "Collecting cluster state..."
+dump "cluster/pods.txt"        kubectl get pods       -n "${NS}" -o wide
+dump "cluster/pods-yaml.yaml"  kubectl get pods       -n "${NS}" -o yaml
+dump "cluster/services.txt"    kubectl get svc        -n "${NS}" -o wide
+dump "cluster/ingresses.txt"   kubectl get ingress    -n "${NS}" -o wide
+dump "cluster/events.txt"      kubectl get events     -n "${NS}" --sort-by='.lastTimestamp'
+dump "cluster/configmaps.txt"  kubectl get cm         -n "${NS}" -o yaml
+dump "cluster/top-pods.txt"    kubectl top pods       -n "${NS}"
+dump "cluster/top-nodes.txt"   kubectl top nodes
+
+# ── Pod descriptions ─────────────────────────────────────────────────────────
+
+log "Describing pods..."
+for pod in $(kubectl get pods -n "${NS}" -o jsonpath='{.items[*].metadata.name}'); do
+  dump "pods/${pod}/describe.txt" kubectl describe pod -n "${NS}" "${pod}"
+done
+
+# ── Ozone app + Istio sidecar logs ───────────────────────────────────────────
+
+log "Collecting pod logs..."
+for pod in $(kubectl get pods -n "${NS}" -o jsonpath='{.items[*].metadata.name}'); do
+  # Determine app container name (first non-istio-proxy container)
+  containers=$(kubectl get pod -n "${NS}" "${pod}" \
+    -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || true)
+
+  for c in ${containers}; do
+    if [[ "${c}" == "istio-proxy" ]]; then
+      log "  ${pod} / istio-proxy"
+      pod_logs "${pod}" "istio-proxy" "istio-proxy"
+    else
+      log "  ${pod} / ${c}"
+      pod_logs "${pod}" "${c}" "${c}"
+    fi
+  done
+
+  # Init containers (e.g. istio-init)
+  init_containers=$(kubectl get pod -n "${NS}" "${pod}" \
+    -o jsonpath='{.spec.initContainers[*].name}' 2>/dev/null || true)
+  for c in ${init_containers}; do
+    dump "pods/${pod}/init-${c}.log" \
+      kubectl logs -n "${NS}" "${pod}" -c "${c}" --tail=500 || true
+  done
+done
+
+# ── Istio proxy stats & config ───────────────────────────────────────────────
+
+ISTIOCTL=$(command -v istioctl 2>/dev/null || \
+  find . /usr/local/bin /usr/bin -name istioctl 2>/dev/null | head -1 || true)
+
+if [[ -n "${ISTIOCTL}" ]]; then
+  log "istioctl found: ${ISTIOCTL}"
+
+  for pod in $(kubectl get pods -n "${NS}" \
+    -o jsonpath='{.items[?(@.spec.containers[*].name=="istio-proxy")].metadata.name}'); do
+
+    log "  Istio proxy-status: ${pod}"
+    dump "istio/proxy-status/${pod}.txt" \
+      "${ISTIOCTL}" proxy-status "${pod}.${NS}"
+
+    log "  Istio proxy-config cluster: ${pod}"
+    dump "istio/proxy-config/${pod}/clusters.txt" \
+      "${ISTIOCTL}" proxy-config cluster "${pod}.${NS}"
+
+    log "  Istio proxy-config listener: ${pod}"
+    dump "istio/proxy-config/${pod}/listeners.txt" \
+      "${ISTIOCTL}" proxy-config listener "${pod}.${NS}"
+
+    log "  Istio proxy-config route: ${pod}"
+    dump "istio/proxy-config/${pod}/routes.txt" \
+      "${ISTIOCTL}" proxy-config route "${pod}.${NS}"
+
+    log "  Istio proxy-config endpoint: ${pod}"
+    dump "istio/proxy-config/${pod}/endpoints.txt" \
+      "${ISTIOCTL}" proxy-config endpoint "${pod}.${NS}"
+
+    log "  Envoy stats: ${pod}"
+    dump "istio/envoy-stats/${pod}.txt" \
+      "${ISTIOCTL}" experimental envoy-stats "${pod}.${NS}"
+  done
+
+  log "  Istio analyze"
+  dump "istio/analyze.txt" "${ISTIOCTL}" analyze -n "${NS}"
+else
+  log "istioctl not found — skipping proxy-config dumps"
+fi
+
+# ── Istio CRDs in namespace ──────────────────────────────────────────────────
+
+log "Collecting Istio CRDs..."
+for kind in destinationrule virtualservice sidecar \
+            peerauthentication authorizationpolicy serviceentry; do
+  dump "istio/crds/${kind}.yaml" \
+    kubectl get "${kind}" -n "${NS}" -o yaml 2>/dev/null || true
+done
+
+# ── istiod logs ──────────────────────────────────────────────────────────────
+
+log "Collecting istiod logs..."
+for pod in $(kubectl get pods -n istio-system \
+  -l app=istiod -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+  dump "istio/istiod/${pod}.log" \
+    kubectl logs -n istio-system "${pod}" --tail=2000
+done
+
+# ── Archive ──────────────────────────────────────────────────────────────────
+
+ARCHIVE="${OUT_DIR}.tar.gz"
+tar -czf "${ARCHIVE}" "${OUT_DIR}"
+rm -rf "${OUT_DIR}"
+
+echo ""
+echo "==> Done: ${ARCHIVE}"
+echo "    $(du -sh "${ARCHIVE}" | cut -f1)"
