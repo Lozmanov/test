@@ -1,69 +1,37 @@
-{{- if .Values.istio.enabled }}
-{{- $ns := include "ozone.namespace" . }}
+    # Require nginx.ingress.kubernetes.io/whitelist-source-range annotation on S3G Ingress.
+    # Applies on CREATE and UPDATE.
+    requireIngressWhitelistSourceRange: false
+    # If non-empty, also validates that the annotation value exactly matches this string.
+    # Leave empty to only check presence.
+    expectedWhitelistSourceRange: ""
 
-{{/*
-  EnvoyFilter: raise TCP idle_timeout on the OM upstream cluster inside S3G pods.
 
-  Root cause: Envoy treats OM port 9862 (Hadoop IPC / raw TCP) as an opaque
-  TCP passthrough cluster.  The default Envoy TCP idle_timeout for such
-  clusters is 10 s.  During large multipart uploads S3G keeps a long-lived IPC
-  connection to OM; when OM is waiting for SCM/Ratis consensus (AllocateBlock),
-  no bytes flow for > 10 s and Envoy silently tears down the TCP connection.
-  S3G then receives a connection reset on the outstanding RPC call.
 
-  This filter targets the S3G pod and patches every cluster whose name
-  contains the OM service hostname on port 9862, setting idle_timeout to 1 h.
-  All other pods and clusters are unaffected.
-*/}}
-
-{{- if .Values.s3g.enabled }}
----
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: {{ include "ozone.fullname" . }}-om-tcp-idle
-  namespace: {{ $ns }}
-  labels:
-    {{- include "ozone.labels" . | nindent 4 }}
-spec:
-  # Apply only to S3G pods — they are the ones opening outbound IPC to OM.
-  workloadSelector:
-    labels:
-      component: {{ .Values.s3g.component }}
-  configPatches:
-    # Patch 1: TCP keepalive on the upstream cluster for OM:9862.
-    # upstream_connection_options is a valid Cluster proto field.
-    - applyTo: CLUSTER
+    {{- if and .Values.s3g.enabled .Values.s3g.ingress.enabled .Values.kubelatte.scope.requireIngressWhitelistSourceRange }}
+    - name: require-ingress-whitelist-source-range
       match:
-        context: SIDECAR_OUTBOUND
-        cluster:
-          portNumber: {{ .Values.om.service.rpcPort }}
-      patch:
-        operation: MERGE
-        value:
-          upstream_connection_options:
-            tcp_keepalive:
-              keepalive_time: 60
-              keepalive_interval: 10
-              keepalive_probes: 3
-    # Patch 2: idle_timeout on the outbound TCP proxy filter for OM:9862.
-    # idle_timeout is a TcpProxy filter field, not a Cluster field — must be
-    # patched here via NETWORK_FILTER, not on the cluster.
-    # 1 hour — well beyond any OM Ratis round-trip.
-    - applyTo: NETWORK_FILTER
-      match:
-        context: SIDECAR_OUTBOUND
-        listener:
-          portNumber: {{ .Values.om.service.rpcPort }}
-          filterChain:
-            filter:
-              name: "envoy.filters.network.tcp_proxy"
-      patch:
-        operation: MERGE
-        value:
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-            idle_timeout: 3600s
-{{- end }}
-
-{{- end }}
+        kinds:
+          - apiGroups:
+              - networking.k8s.io
+            kinds:
+              - Ingress
+        namespaces:
+          - {{ include "ozone.namespace" . }}
+        operations:
+          - CREATE
+          - UPDATE
+      rule:
+        rego: |
+          package kubelatte
+          deny[msg] {
+            not input.metadata.annotations["nginx.ingress.kubernetes.io/whitelist-source-range"]
+            msg := "[ozone] S3G Ingress must have nginx.ingress.kubernetes.io/whitelist-source-range annotation set."
+          }
+          {{- if .Values.kubelatte.scope.expectedWhitelistSourceRange }}
+          deny[msg] {
+            val := input.metadata.annotations["nginx.ingress.kubernetes.io/whitelist-source-range"]
+            val != {{ .Values.kubelatte.scope.expectedWhitelistSourceRange | quote }}
+            msg := sprintf("[ozone] whitelist-source-range must be '{{ .Values.kubelatte.scope.expectedWhitelistSourceRange }}', got '%v'", [val])
+          }
+          {{- end }}
+    {{- end }}
