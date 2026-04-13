@@ -1,52 +1,25 @@
-{{- if .Values.istio.enabled }}
-{{- $ns := include "ozone.namespace" . }}
+              {{- range .Values.s3g.authorizationPolicy.allowedCallers }}
+              {{- if .serviceAccount }}
+              - "cluster.local/ns/{{ .namespace }}/sa/{{ .serviceAccount }}"
+              {{- end }}
+              {{- end }}
+    {{- range .Values.s3g.authorizationPolicy.allowedCallers }}
+    {{- if not .serviceAccount }}
+    - from:
+        - source:
+            namespaces:
+              - {{ .namespace | quote }}
+    {{- end }}
+    {{- end }}
 
-{{/*
-  EnvoyFilter: raise TCP idle_timeout on the OM upstream cluster inside S3G pods.
 
-  Root cause: Envoy treats OM port 9862 (Hadoop IPC / raw TCP) as an opaque
-  TCP passthrough cluster.  The default Envoy TCP idle_timeout for such
-  clusters is 10 s.  During large multipart uploads S3G keeps a long-lived IPC
-  connection to OM; when OM is waiting for SCM/Ratis consensus (AllocateBlock),
-  no bytes flow for > 10 s and Envoy silently tears down the TCP connection.
-  S3G then receives a connection reset on the outstanding RPC call.
+  authorizationPolicy:
+    # Additional callers allowed to access S3G from outside the Ozone namespace.
+    # Requires istio.authorizationPolicy.enabled=true to take effect.
+    # Each entry must specify at least a namespace.
+    # Omit serviceAccount to allow any service account within that namespace.
+    allowedCallers: []
+    # - namespace: my-app-ns
+    # - namespace: processing-ns
+    #   serviceAccount: etl-worker
 
-  This filter targets the S3G pod and patches every cluster whose name
-  contains the OM service hostname on port 9862, setting idle_timeout to 1 h.
-  All other pods and clusters are unaffected.
-*/}}
-
-{{- if .Values.s3g.enabled }}
----
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: {{ include "ozone.fullname" . }}-om-tcp-idle
-  namespace: {{ $ns }}
-  labels:
-    {{- include "ozone.labels" . | nindent 4 }}
-spec:
-  # Apply only to S3G pods — they are the ones opening outbound IPC to OM.
-  workloadSelector:
-    labels:
-      component: {{ .Values.s3g.component }}
-  configPatches:
-    - applyTo: CLUSTER
-      match:
-        context: SIDECAR_OUTBOUND
-        cluster:
-          portNumber: {{ .Values.om.service.rpcPort }}
-      patch:
-        operation: MERGE
-        value:
-          upstream_connection_options:
-            tcp_keepalive:
-              keepalive_time: 60
-              keepalive_interval: 10
-              keepalive_probes: 3
-          # 1 hour — well beyond any OM Ratis round-trip.
-          # 0 would disable the timeout entirely.
-          idle_timeout: 3600s
-{{- end }}
-
-{{- end }}
