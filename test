@@ -1,37 +1,27 @@
-    # Require nginx.ingress.kubernetes.io/whitelist-source-range annotation on S3G Ingress.
-    # Applies on CREATE and UPDATE.
-    requireIngressWhitelistSourceRange: false
-    # If non-empty, also validates that the annotation value exactly matches this string.
-    # Leave empty to only check presence.
-    expectedWhitelistSourceRange: ""
-
-
-
-    {{- if and .Values.s3g.enabled .Values.s3g.ingress.enabled .Values.kubelatte.scope.requireIngressWhitelistSourceRange }}
-    - name: require-ingress-whitelist-source-range
-      match:
-        kinds:
-          - apiGroups:
-              - networking.k8s.io
-            kinds:
-              - Ingress
-        namespaces:
-          - {{ include "ozone.namespace" . }}
-        operations:
-          - CREATE
-          - UPDATE
-      rule:
-        rego: |
-          package kubelatte
-          deny[msg] {
-            not input.metadata.annotations["nginx.ingress.kubernetes.io/whitelist-source-range"]
-            msg := "[ozone] S3G Ingress must have nginx.ingress.kubernetes.io/whitelist-source-range annotation set."
-          }
-          {{- if .Values.kubelatte.scope.expectedWhitelistSourceRange }}
-          deny[msg] {
-            val := input.metadata.annotations["nginx.ingress.kubernetes.io/whitelist-source-range"]
-            val != {{ .Values.kubelatte.scope.expectedWhitelistSourceRange | quote }}
-            msg := sprintf("[ozone] whitelist-source-range must be '{{ .Values.kubelatte.scope.expectedWhitelistSourceRange }}', got '%v'", [val])
-          }
-          {{- end }}
+              {{- range .Values.s3g.authorizationPolicy.allowedCallers }}
+              {{- if .serviceAccount }}
+              - "cluster.local/ns/{{ .namespace }}/sa/{{ .serviceAccount }}"
+              {{- end }}
+              {{- end }}
+    {{- range .Values.s3g.authorizationPolicy.allowedCallers }}
+    {{- if not .serviceAccount }}
+    - from:
+        - source:
+            namespaces:
+              - {{ .namespace | quote }}
     {{- end }}
+    {{- end }}
+    # Note: no fallback "- to: ports" rule here — a rule without "from" would
+    # match any source and bypass all principal/namespace restrictions.
+    # To allow Ingress controller traffic, set istio.ingressController.serviceAccount.
+
+
+  authorizationPolicy:
+    # Additional callers allowed to access S3G from outside the Ozone namespace.
+    # Requires istio.authorizationPolicy.enabled=true to take effect.
+    # Each entry must specify at least a namespace.
+    # Omit serviceAccount to allow any service account within that namespace.
+    allowedCallers: []
+    # - namespace: my-app-ns
+    # - namespace: processing-ns
+    #   serviceAccount: etl-worker
