@@ -1,27 +1,13 @@
-              {{- range .Values.s3g.authorizationPolicy.allowedCallers }}
-              {{- if .serviceAccount }}
-              - "cluster.local/ns/{{ .namespace }}/sa/{{ .serviceAccount }}"
-              {{- end }}
-              {{- end }}
-    {{- range .Values.s3g.authorizationPolicy.allowedCallers }}
-    {{- if not .serviceAccount }}
-    - from:
-        - source:
-            namespaces:
-              - {{ .namespace | quote }}
-    {{- end }}
-    {{- end }}
-    # Note: no fallback "- to: ports" rule here — a rule without "from" would
-    # match any source and bypass all principal/namespace restrictions.
-    # To allow Ingress controller traffic, set istio.ingressController.serviceAccount.
-
-
-  authorizationPolicy:
-    # Additional callers allowed to access S3G from outside the Ozone namespace.
-    # Requires istio.authorizationPolicy.enabled=true to take effect.
-    # Each entry must specify at least a namespace.
-    # Omit serviceAccount to allow any service account within that namespace.
-    allowedCallers: []
-    # - namespace: my-app-ns
-    # - namespace: processing-ns
-    #   serviceAccount: etl-worker
+    annotations:
+      # Restrict S3G ingress to cluster-internal pod CIDRs only.
+      # The whitelist is checked against the real client IP extracted from
+      # X-Forwarded-For (set via server-snippet below), not the direct TCP source.
+      # Find your pod CIDR: kubectl get pod <any-pod> -o wide
+      nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      # Make nginx extract the real client IP from X-Forwarded-For before
+      # applying the whitelist. set_real_ip_from 0.0.0.0/0 trusts all upstream
+      # proxies — narrow it to your LB/proxy CIDR if spoofing is a concern.
+      nginx.ingress.kubernetes.io/server-snippet: |
+        set_real_ip_from 0.0.0.0/0;
+        real_ip_header X-Forwarded-For;
+        real_ip_recursive on;
