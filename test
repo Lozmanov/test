@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -18,6 +19,11 @@ func main() {
 	if err := os.Chdir(hueHome); err != nil {
 		log.Fatalf("chdir %s: %v", hueHome, err)
 	}
+
+	waitForFiles([]string{
+		os.Getenv("HUE_DB_PASSWORD_FILE"),
+		os.Getenv("HUE_SECRET_KEY_FILE"),
+	}, 120*time.Second)
 
 	if pwFile := os.Getenv("HUE_DB_PASSWORD_FILE"); pwFile != "" {
 		data, err := os.ReadFile(pwFile)
@@ -58,5 +64,24 @@ func main() {
 
 	if err := syscall.Exec(python, []string{python, supervisorScript}, os.Environ()); err != nil {
 		log.Fatalf("exec supervisor: %v", err)
+	}
+}
+
+func waitForFiles(paths []string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		for {
+			if _, err := os.Stat(path); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				log.Fatalf("timeout waiting for file: %s", path)
+			}
+			log.Printf("waiting for %s...", path)
+			time.Sleep(2 * time.Second)
+		}
 	}
 }
