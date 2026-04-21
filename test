@@ -1,16 +1,37 @@
-    annotations:
-      # Restrict S3G ingress to cluster-internal pod CIDRs only.
-      # The whitelist is checked against the real client IP extracted from
-      # X-Forwarded-For (set via server-snippet below), not the direct TCP source.
-      # Find your pod CIDR: kubectl get pod <any-pod> -o wide
-      nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-      # Make nginx extract the real client IP from X-Forwarded-For before
-      # applying the whitelist. set_real_ip_from 0.0.0.0/0 trusts all upstream
-      # proxies — narrow it to your LB/proxy CIDR if spoofing is a concern.
-      nginx.ingress.kubernetes.io/server-snippet: |
-        set_real_ip_from 0.0.0.0/0;
-        real_ip_header X-Forwarded-For;
-        real_ip_recursive on;
+package main
+
+import (
+	"log"
+	"os"
+	"os/exec"
+	"syscall"
+)
+
+func main() {
+	hueHome := os.Getenv("HUE_HOME")
+	if hueHome == "" {
+		hueHome = "/usr/share/hue"
+	}
+
+	if err := os.Chdir(hueHome); err != nil {
+		log.Fatalf("chdir %s: %v", hueHome, err)
+	}
+
+	python := hueHome + "/build/env/bin/python"
+	hueScript := hueHome + "/build/env/bin/hue"
+	supervisorScript := hueHome + "/build/env/bin/supervisor"
+	migrate := exec.Command(python, hueScript, "migrate")
+	migrate.Stdout = os.Stdout
+	migrate.Stderr = os.Stderr
+	migrate.Stdin = os.Stdin
+	if err := migrate.Run(); err != nil {
+		log.Printf("warning: hue migrate: %v", err)
+	}
+
+	if err := syscall.Exec(python, []string{python, supervisorScript}, os.Environ()); err != nil {
+		log.Fatalf("exec supervisor: %v", err)
+	}
+}
 
 
 
@@ -18,4 +39,356 @@
 
 
 
+
+
+
+
+
+
+FROM golang:1.21-alpine AS go-builder
+
+WORKDIR /build
+COPY hue-entrypoint.go .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -trimpath -o hue-entrypoint hue-entrypoint.go
+
+FROM almalinux:8 AS extractor
+
+RUN dnf upgrade -y \
+    && dnf install -y --setopt=install_weak_deps=False \
+        python2 \
+        cyrus-sasl-gssapi \
+        cyrus-sasl-plain \
+        gmp \
+        krb5-libs \
+        libffi \
+        libxml2 \
+        libxslt \
+        xmlsec1 \
+        && dnf clean all \
+        && rm -rf /var/cache/yum /tmp/* /var/tmp/* /var/cache/dnf
+
+
+ENV HUE_HOME=/usr/share/hue
+
+RUN groupadd -g 1000 hue && \
+    useradd hue -u 1000 -g hue -s /sbin/nologin -M -d ${HUE_HOME}
+
+COPY --chown=hue:hue hue_root/. ${HUE_HOME}/
+
+RUN ${HUE_HOME}/build/env/bin/pip install \
+        --ignore-installed \
+        --no-index \
+        --find-links=${HUE_HOME}/build/pip-packages/ \
+        psycopg2_binary==2.8.6 && \
+    rm -rf ${HUE_HOME}/build/env/lib/python2.7/site-packages/thrift \
+           ${HUE_HOME}/build/env/lib/python2.7/site-packages/thrift-0.22.0.dist-info
+
+RUN mkdir -p ${HUE_HOME}/logs /var/log/hue /var/run/hue && \
+    chown -R hue:hue ${HUE_HOME} /var/log/hue /var/run/hue
+
+COPY collect-deps.sh /usr/local/bin/collect-deps.sh
+RUN chmod +x /usr/local/bin/collect-deps.sh && \
+    /usr/local/bin/collect-deps.sh /rootfs
+
+FROM scratch
+
+COPY --from=extractor /rootfs/ /
+
+COPY --from=extractor --chown=1000:1000 /usr/share/hue/ /usr/share/hue/
+
+COPY --from=go-builder --chown=1000:1000 /build/hue-entrypoint /usr/share/hue/hue-entrypoint
+
+ENV HUE_HOME=/usr/share/hue
+ENV PATH="/usr/share/hue/build/env/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV HUE_SMTP_PASSWORD=""
+
+USER 1000
+
+EXPOSE 8888
+
+ENTRYPOINT ["/usr/share/hue/hue-entrypoint"]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/bin/bash
+set -exuo pipefail
+
+HUE_HOME="${HUE_HOME:-/usr/share/hue}"
+ROOTFS="${1:-/rootfs}"
+mkdir -p "$ROOTFS"
+
+# ── Вспомогательные функции ─────────────────────────────────────────────────
+
+# Копирует файл в ROOTFS, сохраняя путь. Разыменовывает симлинки.
+copy_file() {
+    local src="$1"
+    [ -e "$src" ] || return 0
+    local real; real="$(readlink -f "$src")"
+    local dest_dir="${ROOTFS}$(dirname "$real")"
+    mkdir -p "$dest_dir"
+    [ -f "${dest_dir}/$(basename "$real")" ] || cp -p "$real" "$dest_dir/"
+    # Воссоздаём симлинк в ROOTFS если src — симлинк
+    if [ -L "$src" ] && [ "$src" != "$real" ]; then
+        local link_dir="${ROOTFS}$(dirname "$src")"
+        local link_name; link_name="$(basename "$src")"
+        mkdir -p "$link_dir"
+        [ -e "${link_dir}/${link_name}" ] || ln -sf "$real" "${link_dir}/${link_name}"
+    fi
+}
+
+# Копирует бинарник и все его динамические зависимости (.so).
+copy_with_deps() {
+    local bin="$1"
+    local real; real="$(readlink -f "$bin")"
+    copy_file "$bin"
+    ldd "$real" 2>/dev/null | while read -r line; do
+        local lib
+        lib="$(echo "$line" | awk '/=>/ {print $3}')"
+        [ -z "$lib" ] && lib="$(echo "$line" | awk 'NF==2 && /^\// {print $1}')"
+        [ -z "$lib" ] || [ "$lib" = "not" ] && continue
+        [ -f "$lib" ] || continue
+        copy_file "$lib"
+    done
+}
+
+# ── 0. Dynamic linker — обязателен для запуска любого ELF-бинаря ─────────────
+# Без него execve возвращает ENOENT даже если бинарь существует.
+echo ">>> Dynamic linker"
+for ldso in /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2 \
+    /lib64/ld-linux-aarch64.so.1 \
+    /lib/ld-linux-aarch64.so.1; do
+    [ -f "$ldso" ] || [ -L "$ldso" ] || continue
+    copy_file "$ldso"
+done
+
+# ── 1. Python binary ──────────────────────────────────────────────────────────
+echo ">>> Python binary"
+PYTHON_BIN="$(readlink -f "$(command -v python2.7 2>/dev/null || command -v python2 2>/dev/null || command -v python)")"
+copy_with_deps "$PYTHON_BIN"
+
+# Симлинки /usr/bin/python, python2, python2.7
+mkdir -p "${ROOTFS}/usr/bin"
+for alias in python python2 python2.7; do
+    [ -e "${ROOTFS}/usr/bin/${alias}" ] || ln -sf "$PYTHON_BIN" "${ROOTFS}/usr/bin/${alias}"
+done
+
+# ── 2. Python стандартная библиотека ─────────────────────────────────────────
+echo ">>> Python stdlib"
+PYTHON_STDLIB="$("$PYTHON_BIN" -c \
+    'import distutils.sysconfig; print(distutils.sysconfig.get_python_lib(standard_lib=True))' \
+    2>/dev/null || echo '')"
+
+if [ -n "$PYTHON_STDLIB" ] && [ -d "$PYTHON_STDLIB" ]; then
+    echo "  stdlib: ${PYTHON_STDLIB}"
+    mkdir -p "${ROOTFS}${PYTHON_STDLIB}"
+    cp -r "${PYTHON_STDLIB}/." "${ROOTFS}${PYTHON_STDLIB}/"
+fi
+
+# Зависимости .so из stdlib (lib-dynload)
+find "${PYTHON_STDLIB:-/usr/lib/python2.7}" -name "*.so*" -type f 2>/dev/null \
+| while read -r sofile; do
+    ldd "$sofile" 2>/dev/null | awk '/=>/ {print $3}' | while read -r lib; do
+        [ -f "$lib" ] || continue
+        copy_file "$lib"
+    done
+done
+
+# ── 3. C-расширения виртуального окружения HUE ───────────────────────────────
+# Сами .so остаются в каталоге HUE (копируются через COPY --from=extractor).
+# Здесь собираем только их системные зависимости.
+echo ">>> HUE virtualenv .so system dependencies"
+find "${HUE_HOME}/build/env/lib" \( -name "*.so*" -o -name "*.so.*" \) -type f 2>/dev/null \
+| while read -r sofile; do
+  { ldd "$sofile" 2>/dev/null || true; } | awk '/=>/ {print $3}' | while read -r lib; do
+        [ -f "$lib" ] || continue
+        copy_file "$lib"
+    done
+done
+
+# ── 4. Системные библиотеки HUE ──────────────────────────────────────────────
+echo ">>> System libraries (sasl2, krb5, xml, ffi, gmp, xmlsec1, ssl, pam)"
+for lib in \
+    /usr/lib64/libpam.so*      /usr/lib/libpam.so* \
+    /lib64/libpam.so*          /lib/libpam.so* \
+    /usr/lib64/libsasl2.so*    /usr/lib/libsasl2.so* \
+    /usr/lib64/libkrb5.so*     /usr/lib/libkrb5.so* \
+    /usr/lib64/libkrb5support.so* /usr/lib/libkrb5support.so* \
+    /usr/lib64/libk5crypto.so* /usr/lib/libk5crypto.so* \
+    /usr/lib64/libcom_err.so*  /usr/lib/libcom_err.so* \
+    /usr/lib64/libgssapi_krb5.so* /usr/lib/libgssapi_krb5.so* \
+    /usr/lib64/libgssapi.so*   /usr/lib/libgssapi.so* \
+    /usr/lib64/libgmp.so*      /usr/lib/libgmp.so* \
+    /usr/lib64/libffi.so*      /usr/lib/libffi.so* \
+    /usr/lib64/libxml2.so*     /usr/lib/libxml2.so* \
+    /usr/lib64/libxslt.so*     /usr/lib/libxslt.so* \
+    /usr/lib64/libexslt.so*    /usr/lib/libexslt.so* \
+    /usr/lib64/libxmlsec1.so*  /usr/lib/libxmlsec1.so* \
+    /usr/lib64/libxmlsec1-openssl.so* /usr/lib/libxmlsec1-openssl.so* \
+    /usr/lib64/libssl.so*      /usr/lib/libssl.so* \
+    /usr/lib64/libcrypto.so*   /usr/lib/libcrypto.so* \
+    /usr/lib64/libz.so*        /usr/lib/libz.so* \
+    /usr/lib64/liblzma.so*     /usr/lib/liblzma.so*; do
+    [ -f "$lib" ] || continue
+    copy_file "$lib"
+    ldd "$lib" 2>/dev/null | awk '/=>/ {print $3}' | while read -r dep; do
+        [ -f "$dep" ] || continue
+        copy_file "$dep"
+    done
+done
+
+# ── 5. SASL-плагины ──────────────────────────────────────────────────────────
+echo ">>> SASL plugins"
+for sasl_dir in /usr/lib64/sasl2 /usr/lib/sasl2; do
+    [ -d "$sasl_dir" ] || continue
+    find "$sasl_dir" -name "*.so*" -type f | while read -r sofile; do
+        copy_file "$sofile"
+        ldd "$sofile" 2>/dev/null | awk '/=>/ {print $3}' | while read -r lib; do
+            [ -f "$lib" ] || continue
+            copy_file "$lib"
+        done
+    done
+done
+
+# ── 6. Kerberos / GSSAPI плагины ─────────────────────────────────────────────
+echo ">>> Kerberos / GSSAPI plugins"
+for gss_dir in /usr/lib64/gss /usr/lib/gss /usr/lib64/krb5/plugins /usr/lib/krb5/plugins; do
+    [ -d "$gss_dir" ] || continue
+    find "$gss_dir" -name "*.so*" -type f | while read -r sofile; do
+        copy_file "$sofile"
+        ldd "$sofile" 2>/dev/null | awk '/=>/ {print $3}' | while read -r lib; do
+            [ -f "$lib" ] || continue
+            copy_file "$lib"
+        done
+    done
+done
+
+# ── 7. NSS-библиотеки (DNS, passwd, group) ───────────────────────────────────
+echo ">>> NSS libraries"
+for nss_so in \
+    /lib64/libnss_*.so*     /lib/libnss_*.so* \
+    /usr/lib64/libnss_*.so* /usr/lib/libnss_*.so*; do
+    [ -f "$nss_so" ] || continue
+    copy_file "$nss_so"
+    ldd "$nss_so" 2>/dev/null | awk '/=>/ {print $3}' | while read -r lib; do
+        [ -f "$lib" ] || continue
+        copy_file "$lib"
+    done
+done
+
+for resolv_so in \
+    /lib64/libresolv.so*     /lib/libresolv.so* \
+    /usr/lib64/libresolv.so* /usr/lib/libresolv.so*; do
+    [ -f "$resolv_so" ] || continue
+    copy_file "$resolv_so"
+done
+
+# ── 8. Системные конфигурационные файлы ──────────────────────────────────────
+echo ">>> System config"
+mkdir -p "${ROOTFS}/etc/ssl/certs" "${ROOTFS}/tmp"
+chmod 1777 "${ROOTFS}/tmp"
+
+cp /etc/passwd "${ROOTFS}/etc/"
+cp /etc/group  "${ROOTFS}/etc/"
+cp /etc/shadow "${ROOTFS}/etc/" 2>/dev/null || true
+
+if [ -f /etc/nsswitch.conf ]; then
+    cp /etc/nsswitch.conf "${ROOTFS}/etc/"
+else
+    printf 'passwd:\tfiles\ngroup:\tfiles\nhosts:\tdns files\n' > "${ROOTFS}/etc/nsswitch.conf"
+fi
+
+touch "${ROOTFS}/etc/resolv.conf"
+touch "${ROOTFS}/etc/hosts"
+
+cp -rL /etc/ssl/certs/. "${ROOTFS}/etc/ssl/certs/" 2>/dev/null || true
+cp /etc/pki/tls/certs/ca-bundle.crt "${ROOTFS}/etc/ssl/certs/" 2>/dev/null || true
+
+# ── 9. Временные зоны ────────────────────────────────────────────────────────
+echo ">>> Timezone data"
+mkdir -p "${ROOTFS}/usr/share"
+cp -r /usr/share/zoneinfo "${ROOTFS}/usr/share/" 2>/dev/null || true
+[ -f /etc/localtime ] && copy_file /etc/localtime
+
+# ── 10. Runtime-каталоги HUE ─────────────────────────────────────────────────
+echo ">>> HUE runtime dirs"
+mkdir -p "${ROOTFS}/var/log/hue"
+mkdir -p "${ROOTFS}/var/run/hue"
+chown 1000:1000 "${ROOTFS}/var/log/hue" "${ROOTFS}/var/run/hue"
+
+# ── 11. /usr/bin/env ──────────────────────────────────────────────────────────
+# On RHEL/AlmaLinux 8, /usr/bin/env is a shebang script that delegates to
+# /usr/bin/coreutils. Both are required so the kernel can resolve
+# #!/usr/bin/env python2.7 shebangs in hue/supervisor subprocess.Popen calls.
+echo ">>> /usr/bin/env + /usr/bin/coreutils"
+copy_file /usr/bin/env
+copy_with_deps /usr/bin/coreutils
+
+# ── 12. /sbin/ldconfig (static) ──────────────────────────────────────────────
+# Python ctypes.util.find_library runs `ldconfig -p` to locate shared libs.
+# pam.py and other modules call find_library("c") at import time;
+# without ldconfig the fallback tries to invoke gcc (absent in distroless).
+# On AlmaLinux 8 /sbin is a symlink to usr/sbin, so copy_file won't create the
+# /sbin/ldconfig symlink automatically — we do it explicitly.
+echo ">>> /sbin/ldconfig"
+copy_file /usr/sbin/ldconfig
+mkdir -p "${ROOTFS}/sbin"
+[ -e "${ROOTFS}/sbin/ldconfig" ] || ln -sf /usr/sbin/ldconfig "${ROOTFS}/sbin/ldconfig"
+
+# ── 13. ld.so.cache ───────────────────────────────────────────────────────────
+# ldconfig -p reads /etc/ld.so.cache; without it ctypes.util._findSoname_ldconfig
+# returns None and Python 2.7 falls through to gcc (absent in distroless).
+echo ">>> ld.so.cache"
+printf '/usr/lib64\n/lib64\n' > "${ROOTFS}/etc/ld.so.conf"
+/sbin/ldconfig -r "${ROOTFS}"
+
+find "${ROOTFS}" -name "*.so*" -type f -exec chmod 755 {} \;
+
+echo ">>> Done. rootfs size: $(du -sh "${ROOTFS}" | cut -f1)"
+
+
+
+
+
+    appsBlacklist: "distcp,impala,pig,rdbms,search,security,zookeeper,importer,jobbrowser,hive,metastore,hbase,spark,oozie,jobsub"
+
+
+      app_blacklist={{ .Values.hue.config.appsBlacklist }}
+
+
+    [notebook]
+      show_notebooks=false
+      [[interpreters]]
+        [[[hive]]]
+          name=Hive
+          interface=hiveserver2
+
+
+
+
+
+
+
+
+
+
+
+
+
