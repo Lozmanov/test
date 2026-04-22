@@ -1,44 +1,52 @@
-{{- if and .Values.istio.enabled .Values.prometheus.enabled .Values.prometheus.apiServerCIDR }}
----
-apiVersion: networking.istio.io/v1beta1
-kind: DestinationRule
-metadata:
-  name: {{ include "ozone.fullname" . }}-kubernetes-api
-  namespace: {{ include "ozone.namespace" . }}
-  labels:
-    {{- include "ozone.labels" . | nindent 4 }}
-spec:
-  host: kubernetes-api.cluster.local
-  trafficPolicy:
-    tls:
-      mode: PASSTHROUGH
-{{- end }}
-
-
-
-
-{{- if and .Values.prometheus.enabled .Values.prometheus.apiServerCIDR }}
-{{- $apiServerIP := .Values.prometheus.apiServerCIDR | trimSuffix "/32" }}
-{{- if $apiServerIP }}
+{{- if and .Values.prometheus.enabled .Values.prometheus.podCIDR }}
 ---
 apiVersion: networking.istio.io/v1beta1
 kind: ServiceEntry
 metadata:
-  name: {{ include "ozone.fullname" . }}-kubernetes-api
+  name: {{ include "ozone.fullname" . }}-pod-network
   namespace: {{ include "ozone.namespace" . }}
   labels:
     {{- include "ozone.labels" . | nindent 4 }}
 spec:
   hosts:
-    - kubernetes-api.cluster.local
+    - pod-network.cluster.local
   addresses:
-    - {{ $apiServerIP }}/32
+    - {{ .Values.prometheus.podCIDR }}
   ports:
-    - number: 443
-      name: tls-kubernetes-api
-      protocol: TLS
+    {{- if .Values.om.enabled }}
+    - number: {{ .Values.om.service.port }}
+      name: http-om
+      protocol: HTTP
+    {{- end }}
+    {{- if .Values.scm.enabled }}
+    - number: {{ .Values.scm.service.port }}
+      name: http-scm
+      protocol: HTTP
+    {{- end }}
+    {{- if .Values.datanode.enabled }}
+    - number: {{ .Values.datanode.service.prometheusPort }}
+      name: http-datanode
+      protocol: HTTP
+    {{- end }}
+    {{- if .Values.s3g.enabled }}
+    - number: {{ .Values.s3g.service.rest.port }}
+      name: http-s3g
+      protocol: HTTP
+    {{- end }}
+    {{- if .Values.recon.enabled }}
+    - number: {{ .Values.recon.service.port }}
+      name: http-recon
+      protocol: HTTP
+    {{- end }}
   resolution: NONE
   location: MESH_EXTERNAL
 {{- end }}
-{{- end }}
+
+
+
+
+{{- if .Values.prometheus.podCIDR }}
+        - "./pod-network.cluster.local"
+        {{- end }}
+
 
