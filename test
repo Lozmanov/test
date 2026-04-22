@@ -1,75 +1,14 @@
-{{- if and .Values.prometheus.enabled (gt (len .Values.prometheus.remoteWrite) 0) }}
-{{- $rwEndpoints := dict }}
-{{- range .Values.prometheus.remoteWrite }}
-{{- if .url }}
-  {{- $isHttps := hasPrefix "https://" .url }}
-  {{- $host := regexReplaceAll "^https?://([^/:?#]+).*" .url "$1" }}
-  {{- $port := ternary 443 80 $isHttps }}
-  {{- if regexMatch "^https?://[^/:?#]+:[0-9]+" .url }}
-    {{- $portStr := regexReplaceAll "^https?://[^/:?#]+:([0-9]+).*" .url "$1" }}
-    {{- $port = int $portStr }}
-  {{- end }}
-  {{- $protocol := ternary "HTTPS" "HTTP" $isHttps }}
-  {{- $key := printf "%s_%d" $host $port }}
-  {{- if not (hasKey $rwEndpoints $key) }}
-    {{- $_ := set $rwEndpoints $key (dict "host" $host "port" $port "protocol" $protocol) }}
-  {{- end }}
-{{- end }}
-{{- end }}
-{{- range $key, $ep := $rwEndpoints }}
----
+{{- if and .Values.istio.enabled .Values.prometheus.enabled }}
 apiVersion: networking.istio.io/v1beta1
-kind: ServiceEntry
+kind: DestinationRule
 metadata:
-  name: {{ include "ozone.fullname" $ }}-prometheus-rw-{{ $ep.host | replace "." "-" | lower | trunc 40 | trimSuffix "-" }}
-  namespace: {{ include "ozone.namespace" $ }}
-  labels:
-    {{- include "ozone.labels" $ | nindent 4 }}
-spec:
-  hosts:
-    - {{ $ep.host | quote }}
-  ports:
-    - number: {{ $ep.port }}
-      name: {{ lower $ep.protocol }}-prometheus-rw
-      protocol: {{ $ep.protocol }}
-  resolution: DNS
-  location: MESH_EXTERNAL
-{{- end }}
-{{- end }}
-
-
-
-
-
-{{- if .Values.prometheus.enabled }}
----
-apiVersion: networking.istio.io/v1beta1
-kind: Sidecar
-metadata:
-  name: {{ include "ozone.fullname" . }}-prometheus
-  namespace: {{ $ns }}
+  name: {{ include "ozone.fullname" . }}-kubernetes-api
+  namespace: {{ include "ozone.namespace" . }}
   labels:
     {{- include "ozone.labels" . | nindent 4 }}
 spec:
-  workloadSelector:
-    labels:
-      component: {{ .Values.prometheus.component }}
-  egress:
-    - hosts:
-        - "./*"
-        - "default/kubernetes.default.svc.{{ .Values.global.clusterDomain }}"
-        {{- range .Values.prometheus.remoteWrite }}
-        {{- if .url }}
-        - "./{{ regexReplaceAll "^https?://([^/:?#]+).*" .url "$1" }}"
-        {{- end }}
-        {{- end }}
-        {{- if .Values.secman.enabled }}
-        - "./{{ .Values.secman.hostname }}"
-        {{- end }}
+  host: kubernetes.default.svc.{{ .Values.global.clusterDomain }}
+  trafficPolicy:
+    tls:
+      mode: DISABLE
 {{- end }}
-
-
-
-
-
-
