@@ -1,14 +1,37 @@
-{{- if and .Values.istio.enabled .Values.prometheus.enabled }}
-apiVersion: networking.istio.io/v1beta1
-kind: DestinationRule
+{{- if and .Values.prometheus.enabled .Values.prometheus.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
 metadata:
-  name: {{ include "ozone.fullname" . }}-kubernetes-api
+  name: {{ .Values.prometheus.serviceName }}-ingress
   namespace: {{ include "ozone.namespace" . }}
   labels:
     {{- include "ozone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ozone-prometheus
+  {{- with .Values.prometheus.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
-  host: kubernetes.default.svc.{{ .Values.global.clusterDomain }}
-  trafficPolicy:
-    tls:
-      mode: DISABLE
-{{- end }}
+  ingressClassName: {{ .Values.prometheus.ingress.className }}
+  rules:
+    - host: {{ include "ozone.ingress.host" (dict "host" .Values.prometheus.ingress.host "component" .Values.prometheus.serviceName "ctx" .) }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Values.prometheus.serviceName }}
+                port:
+                  number: 9090
+  {{- if .Values.prometheus.ingress.tls }}
+  tls:
+    {{- toYaml .Values.prometheus.ingress.tls | nindent 4 }}
+  {{- end }}
+{{- end }}  ingress:
+    enabled: false
+    className: nginx
+    host: ""
+    annotations: {}
+    tls: []
