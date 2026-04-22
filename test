@@ -1,87 +1,75 @@
-package main
+{{- if and .Values.prometheus.enabled (gt (len .Values.prometheus.remoteWrite) 0) }}
+{{- $rwEndpoints := dict }}
+{{- range .Values.prometheus.remoteWrite }}
+{{- if .url }}
+  {{- $isHttps := hasPrefix "https://" .url }}
+  {{- $host := regexReplaceAll "^https?://([^/:?#]+).*" .url "$1" }}
+  {{- $port := ternary 443 80 $isHttps }}
+  {{- if regexMatch "^https?://[^/:?#]+:[0-9]+" .url }}
+    {{- $portStr := regexReplaceAll "^https?://[^/:?#]+:([0-9]+).*" .url "$1" }}
+    {{- $port = int $portStr }}
+  {{- end }}
+  {{- $protocol := ternary "HTTPS" "HTTP" $isHttps }}
+  {{- $key := printf "%s_%d" $host $port }}
+  {{- if not (hasKey $rwEndpoints $key) }}
+    {{- $_ := set $rwEndpoints $key (dict "host" $host "port" $port "protocol" $protocol) }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- range $key, $ep := $rwEndpoints }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: {{ include "ozone.fullname" $ }}-prometheus-rw-{{ $ep.host | replace "." "-" | lower | trunc 40 | trimSuffix "-" }}
+  namespace: {{ include "ozone.namespace" $ }}
+  labels:
+    {{- include "ozone.labels" $ | nindent 4 }}
+spec:
+  hosts:
+    - {{ $ep.host | quote }}
+  ports:
+    - number: {{ $ep.port }}
+      name: {{ lower $ep.protocol }}-prometheus-rw
+      protocol: {{ $ep.protocol }}
+  resolution: DNS
+  location: MESH_EXTERNAL
+{{- end }}
+{{- end }}
 
-import (
-	"fmt"
-	"log"
-	"os"
-	"os/exec"
-	"strings"
-	"syscall"
-	"time"
-)
 
-func main() {
-	hueHome := os.Getenv("HUE_HOME")
-	if hueHome == "" {
-		hueHome = "/usr/share/hue"
-	}
 
-	if err := os.Chdir(hueHome); err != nil {
-		log.Fatalf("chdir %s: %v", hueHome, err)
-	}
 
-	waitForFiles([]string{
-		os.Getenv("HUE_DB_PASSWORD_FILE"),
-		os.Getenv("HUE_SECRET_KEY_FILE"),
-	}, 120*time.Second)
 
-	if pwFile := os.Getenv("HUE_DB_PASSWORD_FILE"); pwFile != "" {
-		data, err := os.ReadFile(pwFile)
-		if err != nil {
-			log.Fatalf("read HUE_DB_PASSWORD_FILE %s: %v", pwFile, err)
-		}
-		password := strings.TrimRight(string(data), "\r\n")
-		overrideIni := fmt.Sprintf("[desktop]\n  [[database]]\n    password=%s\n", password)
-		overridePath := hueHome + "/desktop/conf/zz-db-password.ini"
-		if err := os.WriteFile(overridePath, []byte(overrideIni), 0600); err != nil {
-			log.Fatalf("write db password override: %v", err)
-		}
-	}
+{{- if .Values.prometheus.enabled }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Sidecar
+metadata:
+  name: {{ include "ozone.fullname" . }}-prometheus
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  workloadSelector:
+    labels:
+      component: {{ .Values.prometheus.component }}
+  egress:
+    - hosts:
+        - "./*"
+        - "default/kubernetes.default.svc.{{ .Values.global.clusterDomain }}"
+        {{- range .Values.prometheus.remoteWrite }}
+        {{- if .url }}
+        - "./{{ regexReplaceAll "^https?://([^/:?#]+).*" .url "$1" }}"
+        {{- end }}
+        {{- end }}
+        {{- if .Values.secman.enabled }}
+        - "./{{ .Values.secman.hostname }}"
+        {{- end }}
+{{- end }}
 
-	if skFile := os.Getenv("HUE_SECRET_KEY_FILE"); skFile != "" {
-		data, err := os.ReadFile(skFile)
-		if err != nil {
-			log.Fatalf("read HUE_SECRET_KEY_FILE %s: %v", skFile, err)
-		}
-		secretKey := strings.TrimRight(string(data), "\r\n")
-		overrideIni := fmt.Sprintf("[desktop]\n  secret_key=%s\n", secretKey)
-		overridePath := hueHome + "/desktop/conf/zz-secret-key.ini"
-		if err := os.WriteFile(overridePath, []byte(overrideIni), 0600); err != nil {
-			log.Fatalf("write secret key override: %v", err)
-		}
-	}
 
-	python := hueHome + "/build/env/bin/python"
-	hueScript := hueHome + "/build/env/bin/hue"
-	supervisorScript := hueHome + "/build/env/bin/supervisor"
-	migrate := exec.Command(python, hueScript, "migrate")
-	migrate.Stdout = os.Stdout
-	migrate.Stderr = os.Stderr
-	migrate.Stdin = os.Stdin
-	if err := migrate.Run(); err != nil {
-		log.Printf("warning: hue migrate: %v", err)
-	}
 
-	if err := syscall.Exec(python, []string{python, supervisorScript}, os.Environ()); err != nil {
-		log.Fatalf("exec supervisor: %v", err)
-	}
-}
 
-func waitForFiles(paths []string, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for _, path := range paths {
-		if path == "" {
-			continue
-		}
-		for {
-			if _, err := os.Stat(path); err == nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				log.Fatalf("timeout waiting for file: %s", path)
-			}
-			log.Printf("waiting for %s...", path)
-			time.Sleep(2 * time.Second)
-		}
-	}
-}
+
+
