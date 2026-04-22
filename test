@@ -1,128 +1,44 @@
-{{- if .Values.prometheus.enabled }}
-apiVersion: apps/v1
-kind: Deployment
+{{- if and .Values.istio.enabled .Values.prometheus.enabled .Values.prometheus.apiServerCIDR }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
 metadata:
-  name: {{ .Values.prometheus.serviceName }}
+  name: {{ include "ozone.fullname" . }}-kubernetes-api
   namespace: {{ include "ozone.namespace" . }}
   labels:
     {{- include "ozone.labels" . | nindent 4 }}
-    app.kubernetes.io/component: ozone-prometheus
 spec:
-  replicas: {{ .Values.prometheus.replicas }}
-  selector:
-    matchLabels:
-      {{- include "ozone.selectorLabels" . | nindent 6 }}
-      component: {{ .Values.prometheus.component }}
-  template:
-    metadata:
-      labels:
-        {{- include "ozone.selectorLabels" . | nindent 8 }}
-        {{- include "ozone.secmanLabels" . | nindent 8 }}
-        component: {{ .Values.prometheus.component }}
-      annotations:
-        {{- include "ozone.secmanAnnotations" . | nindent 8 }}
-        {{- include "ozone.istioAnnotations" . | nindent 8 }}
-        {{- if and .Values.istio.enabled .Values.istio.injection.enabled }}
-        {{- $apiServerCIDR := .Values.prometheus.apiServerCIDR }}
-        {{- if not $apiServerCIDR }}
-          {{- $k8sSvc := lookup "v1" "Service" "default" "kubernetes" }}
-          {{- if and $k8sSvc $k8sSvc.spec }}
-            {{- $apiServerCIDR = printf "%s/32" $k8sSvc.spec.clusterIP }}
-          {{- end }}
-        {{- end }}
-        {{- if $apiServerCIDR }}
-        traffic.sidecar.istio.io/excludeOutboundIPRanges: {{ $apiServerCIDR | quote }}
-        {{- end }}
-        {{- $scrapePorts := list }}
-        {{- if .Values.om.enabled }}
-          {{- $scrapePorts = append $scrapePorts (.Values.om.service.port | toString) }}
-        {{- end }}
-        {{- if .Values.scm.enabled }}
-          {{- $scrapePorts = append $scrapePorts (.Values.scm.service.port | toString) }}
-        {{- end }}
-        {{- if .Values.datanode.enabled }}
-          {{- $scrapePorts = append $scrapePorts (.Values.datanode.service.prometheusPort | toString) }}
-        {{- end }}
-        {{- if .Values.s3g.enabled }}
-          {{- $scrapePorts = append $scrapePorts (.Values.s3g.service.rest.port | toString) }}
-        {{- end }}
-        {{- if .Values.recon.enabled }}
-          {{- $scrapePorts = append $scrapePorts (.Values.recon.service.port | toString) }}
-        {{- end }}
-        {{- if $scrapePorts }}
-        traffic.sidecar.istio.io/excludeOutboundPorts: {{ $scrapePorts | uniq | join "," | quote }}
-        {{- end }}
-        {{- end }}
-    spec:
-      {{- include "ozone.podSecurityContext" $ | nindent 6 }}
-      serviceAccountName: {{ .Values.prometheus.serviceAccount.name }}
-      {{- with .Values.global.image.pullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      containers:
-        - name: prometheus
-          image: "{{ .Values.global.image.registry }}/{{ tpl .Values.prometheus.image.repository . }}:{{ tpl .Values.prometheus.image.tag . }}"
-          {{- include "ozone.containerSecurityContext" $ | nindent 10 }}
-          imagePullPolicy: Always
-          args:
-            - '--storage.tsdb.path=/data'
-            - '--config.file=/prometheus/config/prometheus.yml'
-            - '--web.listen-address=:9090'
-            - '--storage.tsdb.retention.time=36h'
-            - '--storage.tsdb.retention.size=4.4GB'
-            - '--log.level=warn'
-            - '--web.enable-lifecycle'
-          ports:
-            - name: port-prometheus
-              containerPort: 9090
-              protocol: TCP
-          livenessProbe:
-            httpGet:
-              path: /-/healthy
-              port: 9090
-              scheme: HTTP
-            initialDelaySeconds: 15
-            timeoutSeconds: 30
-            periodSeconds: 60
-            successThreshold: 1
-            failureThreshold: 3
-          readinessProbe:
-            httpGet:
-              path: /-/ready
-              port: 9090
-              scheme: HTTP
-            initialDelaySeconds: 5
-            timeoutSeconds: 40
-            periodSeconds: 60
-            successThreshold: 1
-            failureThreshold: 5
-          {{- with .Values.prometheus.resources }}
-          resources:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          volumeMounts:
-            - name: prometheus-data
-              mountPath: /data
-            - name: prometheus-root-config
-              mountPath: /prometheus/config
-      volumes:
-        - name: prometheus-data
-          emptyDir:
-            sizeLimit: {{ .Values.prometheus.storage.sizeLimit }}
-        - name: prometheus-root-config
-          configMap:
-            name: {{ include "ozone.fullname" . }}-prometheus-root-config
-            defaultMode: 256
-            optional: false
-      affinity:
-        podAntiAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchExpressions:
-                  - key: component
-                    operator: In
-                    values:
-                      - {{ .Values.prometheus.component }}
-              topologyKey: kubernetes.io/hostname
+  host: kubernetes-api.cluster.local
+  trafficPolicy:
+    tls:
+      mode: PASSTHROUGH
 {{- end }}
+
+
+
+
+{{- if and .Values.prometheus.enabled .Values.prometheus.apiServerCIDR }}
+{{- $apiServerIP := .Values.prometheus.apiServerCIDR | trimSuffix "/32" }}
+{{- if $apiServerIP }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: {{ include "ozone.fullname" . }}-kubernetes-api
+  namespace: {{ include "ozone.namespace" . }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+spec:
+  hosts:
+    - kubernetes-api.cluster.local
+  addresses:
+    - {{ $apiServerIP }}/32
+  ports:
+    - number: 443
+      name: tls-kubernetes-api
+      protocol: TLS
+  resolution: NONE
+  location: MESH_EXTERNAL
+{{- end }}
+{{- end }}
+
