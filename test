@@ -1,65 +1,46 @@
-{{- if .Values.recon.auth.enabled }}
-        - name: recon-auth-proxy
-          image: {{ .Values.recon.auth.image }}
-          securityContext:
-            allowPrivilegeEscalation: false
-            runAsNonRoot: true
-            runAsUser: 101
-            seccompProfile:
-              type: RuntimeDefault
-            capabilities:
-              drop:
-                - ALL
-          command:
-            - sh
-            - -c
-            - |
-              until [ -f {{ .Values.recon.auth.secretPaths.username }} ] && [ -f {{ .Values.recon.auth.secretPaths.password }} ]; do
-                sleep 1
-              done
-              printf '%s:%s\n' \
-                "$(cat {{ .Values.recon.auth.secretPaths.username }})" \
-                "$(openssl passwd -apr1 "$(cat {{ .Values.recon.auth.secretPaths.password }})")" \
-                > /tmp/htpasswd
-              exec nginx -g 'daemon off;'
-          ports:
-            - containerPort: 19888
-              name: ui-proxy
-          volumeMounts:
-            - name: recon-nginx-config
-              mountPath: /etc/nginx/nginx.conf
-              subPath: nginx.conf
-        {{- end }}
+{{- if and .Values.recon.enabled .Values.recon.auth.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ozone.fullname" . }}-recon-nginx
+  namespace: {{ include "ozone.namespace" . }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ozone-recon
+data:
+  nginx.conf: |
+    worker_processes auto;
+    error_log /dev/stderr warn;
+    pid /tmp/nginx.pid;
 
+    events {
+      worker_connections 1024;
+    }
 
+    http {
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path       /tmp/proxy_temp;
+      fastcgi_temp_path     /tmp/fastcgi_temp;
+      uwsgi_temp_path       /tmp/uwsgi_temp;
+      scgi_temp_path        /tmp/scgi_temp;
 
+      access_log /dev/stdout combined;
 
-{{- if .Values.recon.auth.enabled }}
-        - name: recon-nginx-config
-          configMap:
-            name: {{ include "ozone.fullname" . }}-recon-nginx
-        {{- end }}
+      server {
+        listen 19888;
+        server_name _;
 
-
-syncPort: 9891
-  # Arbitrary annotations added to the recon pod (e.g. Vault agent inject annotations).
-  podAnnotations: {}
-  auth:
-    # Enable HTTP Basic Auth in front of the Recon UI via an nginx sidecar proxy.
-    # Credentials are read from files injected by vault-agent (no Kubernetes Secrets).
-    # When enabled, Service port 9888 is routed through nginx (port 19888).
-    # Health probes still hit recon directly on 9888 and bypass authentication.
-    enabled: false
-    # Non-root nginx image with openssl and sh (uid 101).
-    image: "nginxinc/nginx-unprivileged:alpine"
-    # Paths where vault-agent writes the plaintext username and password files.
-    secretPaths:
-      username: /vault/secrets/recon-username
-      password: /vault/secrets/recon-password
-
-
-
-
-targetPort: {{ if .Values.recon.auth.enabled }}19888{{ else }}{{ .Values.recon.service.port }}{{ end }}
-
-
+        location / {
+          auth_basic "Ozone Recon";
+          auth_basic_user_file /tmp/htpasswd;
+          proxy_pass http://127.0.0.1:{{ .Values.recon.service.port }};
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+        }
+      }
+    }
+{{- end }}
