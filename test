@@ -1,52 +1,65 @@
-{{- if and .Values.prometheus.enabled .Values.prometheus.podCIDR }}
----
-apiVersion: networking.istio.io/v1beta1
-kind: ServiceEntry
-metadata:
-  name: {{ include "ozone.fullname" . }}-pod-network
-  namespace: {{ include "ozone.namespace" . }}
-  labels:
-    {{- include "ozone.labels" . | nindent 4 }}
-spec:
-  hosts:
-    - pod-network.cluster.local
-  addresses:
-    - {{ .Values.prometheus.podCIDR }}
-  ports:
-    {{- if .Values.om.enabled }}
-    - number: {{ .Values.om.service.port }}
-      name: http-om
-      protocol: HTTP
-    {{- end }}
-    {{- if .Values.scm.enabled }}
-    - number: {{ .Values.scm.service.port }}
-      name: http-scm
-      protocol: HTTP
-    {{- end }}
-    {{- if .Values.datanode.enabled }}
-    - number: {{ .Values.datanode.service.prometheusPort }}
-      name: http-datanode
-      protocol: HTTP
-    {{- end }}
-    {{- if .Values.s3g.enabled }}
-    - number: {{ .Values.s3g.service.rest.port }}
-      name: http-s3g
-      protocol: HTTP
-    {{- end }}
-    {{- if .Values.recon.enabled }}
-    - number: {{ .Values.recon.service.port }}
-      name: http-recon
-      protocol: HTTP
-    {{- end }}
-  resolution: NONE
-  location: MESH_EXTERNAL
-{{- end }}
-
-
-
-
-{{- if .Values.prometheus.podCIDR }}
-        - "./pod-network.cluster.local"
+{{- if .Values.recon.auth.enabled }}
+        - name: recon-auth-proxy
+          image: {{ .Values.recon.auth.image }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 101
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - sh
+            - -c
+            - |
+              until [ -f {{ .Values.recon.auth.secretPaths.username }} ] && [ -f {{ .Values.recon.auth.secretPaths.password }} ]; do
+                sleep 1
+              done
+              printf '%s:%s\n' \
+                "$(cat {{ .Values.recon.auth.secretPaths.username }})" \
+                "$(openssl passwd -apr1 "$(cat {{ .Values.recon.auth.secretPaths.password }})")" \
+                > /tmp/htpasswd
+              exec nginx -g 'daemon off;'
+          ports:
+            - containerPort: 19888
+              name: ui-proxy
+          volumeMounts:
+            - name: recon-nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
         {{- end }}
+
+
+
+
+{{- if .Values.recon.auth.enabled }}
+        - name: recon-nginx-config
+          configMap:
+            name: {{ include "ozone.fullname" . }}-recon-nginx
+        {{- end }}
+
+
+syncPort: 9891
+  # Arbitrary annotations added to the recon pod (e.g. Vault agent inject annotations).
+  podAnnotations: {}
+  auth:
+    # Enable HTTP Basic Auth in front of the Recon UI via an nginx sidecar proxy.
+    # Credentials are read from files injected by vault-agent (no Kubernetes Secrets).
+    # When enabled, Service port 9888 is routed through nginx (port 19888).
+    # Health probes still hit recon directly on 9888 and bypass authentication.
+    enabled: false
+    # Non-root nginx image with openssl and sh (uid 101).
+    image: "nginxinc/nginx-unprivileged:alpine"
+    # Paths where vault-agent writes the plaintext username and password files.
+    secretPaths:
+      username: /vault/secrets/recon-username
+      password: /vault/secrets/recon-password
+
+
+
+
+targetPort: {{ if .Values.recon.auth.enabled }}19888{{ else }}{{ .Values.recon.service.port }}{{ end }}
 
 
