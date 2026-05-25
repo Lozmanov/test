@@ -1,8 +1,25 @@
-exec /bin/oauth2-proxy \                                                                                                                                                                                                
-  --provider=htpasswd \                                                                                                                                                                                                 
-  --htpasswd-file={{ .Values.recon.auth.htpasswdPath }} \                                                                                                                                                               
-  --upstream=http://127.0.0.1:{{ .Values.recon.service.port }} \                                                                                                                                                        
-  --http-address=0.0.0.0:19888 \                                                                                                                                                                                        
-  --cookie-secret=$(openssl rand -hex 16) \                                                                                                                                                                             
-  --cookie-secure=false \                                                                                                                                                                                               
-  --email-domain=*   
+        {{- if .Values.om.enabled }}
+        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./*.{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        {{- end }}
+        {{- if .Values.scm.enabled }}
+        - "./{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./*.{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        {{- end }}
+        {{- if .Values.datanode.enabled }}
+        - "./{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        - "./*.{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        {{- end }}
+        {{- if .Values.recon.enabled }}
+        - "./{{ .Values.recon.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        {{- end }}
+        {{- if .Values.s3g.enabled }}
+        - "./{{ .Values.s3g.serviceName }}-rest.{{ $ns }}.svc.{{ $dom }}"
+        - "./{{ .Values.s3g.serviceName }}-web.{{ $ns }}.svc.{{ $dom }}"
+        {{- end }}
+        {{- if .Values.hue.enabled }}
+        - "./{{ .Values.hue.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        {{- end }}
+        {{- if .Values.hiveMetastore.enabled }}
+        - "./{{ .Values.hiveMetastore.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
+        {{- end }}
