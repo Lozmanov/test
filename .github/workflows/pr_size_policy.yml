@@ -33,12 +33,10 @@ jobs:
           APPROVER_LOGINS: ${{ vars.PR_SIZE_APPROVERS }}
           EXCLUDE_PATTERNS: |
             **/*.lock
-            **/package-lock.json
-            **/yarn.lock
-            **/Cargo.lock
-            **/poetry.lock
-            **/go.sum
+            **/*.lockfile
             **/generated/**
+            **/third-party/**
+            **/*.g.cs
             **/*_generated.*
             **/*.generated.*
         with:
@@ -62,6 +60,13 @@ jobs:
             const sha = pr.head.sha;
             const statusContext = 'PR Size Policy';
             const marker = '<!-- pr-size-policy -->';
+
+            // pull_request_review carries no branch filter, so guard against
+            // reviews on PRs targeting branches other than the protected one.
+            if (pr.base.ref !== 'master') {
+              console.log(`Skipping: PR targets ${pr.base.ref}, not master.`);
+              return;
+            }
 
             // --- glob -> regex (supports ** and *) -------------------------
             function globToRegExp(glob) {
@@ -161,8 +166,11 @@ jobs:
             }
 
             // --- publish the status check ----------------------------------
+            const targetUrl =
+              `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
             await github.rest.repos.createCommitStatus({
               owner, repo, sha, state, context: statusContext, description,
+              target_url: targetUrl,
             });
             console.log(`Status: ${state} — ${description}`);
 
