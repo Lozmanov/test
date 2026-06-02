@@ -1,0 +1,190 @@
+name: PR Size Policy
+
+# Test-tuned copy of the GG-49018 PR size policy workflow.
+# Differences from the gridgain-9 version: repo guard, target branch (master),
+# default GITHUB_TOKEN + explicit permissions (no GH_TOKEN secret here), and
+# lowered thresholds (WARN=10, HARD=20) so test PRs stay tiny.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [master]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+concurrency:
+  group: pr-size-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-pr-size:
+    runs-on: ubuntu-latest
+    if: github.repository == 'Lozmanov/test'
+    permissions:
+      statuses: write
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Evaluate PR size policy
+        uses: actions/github-script@v7
+        env:
+          WARN_THRESHOLD: '10'
+          HARD_THRESHOLD: '20'
+          APPROVER_LOGINS: ${{ vars.PR_SIZE_APPROVERS }}
+          EXCLUDE_PATTERNS: |
+            **/*.lock
+            **/package-lock.json
+            **/yarn.lock
+            **/Cargo.lock
+            **/poetry.lock
+            **/go.sum
+            **/generated/**
+            **/*_generated.*
+            **/*.generated.*
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const warnThreshold = parseInt(process.env.WARN_THRESHOLD, 10);
+            const hardThreshold = parseInt(process.env.HARD_THRESHOLD, 10);
+            const approvers = new Set(
+              (process.env.APPROVER_LOGINS || '')
+                .split(/[\s,]+/)
+                .map(s => s.trim().toLowerCase())
+                .filter(Boolean)
+            );
+            const excludePatterns = (process.env.EXCLUDE_PATTERNS || '')
+              .split(/[\r\n,]+/)
+              .map(s => s.trim())
+              .filter(Boolean);
+
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const sha = pr.head.sha;
+            const statusContext = 'PR Size Policy';
+            const marker = '<!-- pr-size-policy -->';
+
+            // --- glob -> regex (supports ** and *) -------------------------
+            function globToRegExp(glob) {
+              let re = '';
+              for (let i = 0; i < glob.length; i++) {
+                const c = glob[i];
+                if (c === '*') {
+                  if (glob[i + 1] === '*') {
+                    re += '.*';
+                    i++;
+                    if (glob[i + 1] === '/') i++; // collapse `**/`
+                  } else {
+                    re += '[^/]*';
+                  }
+                } else if ('\\^$+?.()|[]{}'.includes(c)) {
+                  re += '\\' + c;
+                } else {
+                  re += c;
+                }
+              }
+              return new RegExp('^' + re + '$');
+            }
+            const excludeRes = excludePatterns.map(globToRegExp);
+            const isExcluded = (name) => excludeRes.some(re => re.test(name));
+
+            // --- count added lines, excluding generated/vendored files -----
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number,
+            });
+            const counted = files.filter(f => !isExcluded(f.filename));
+            const additions = counted.reduce((sum, f) => sum + f.additions, 0);
+            console.log(
+              `PR #${pr.number}: ${additions} added lines across ` +
+              `${counted.length}/${files.length} files (rest excluded)`
+            );
+
+            // --- classify --------------------------------------------------
+            let state, description, body;
+            if (additions < warnThreshold) {
+              state = 'success';
+              description = `${additions} added lines (< ${warnThreshold}).`;
+              body = null;
+            } else if (additions < hardThreshold) {
+              state = 'success';
+              description = `${additions} added lines — large PR (warning).`;
+              body =
+                `${marker}\n` +
+                `### ⚠️ Large pull request\n\n` +
+                `This PR adds **${additions}** lines ` +
+                `(threshold: ${warnThreshold}). Large PRs are harder to review ` +
+                `thoroughly — please consider splitting it into smaller, ` +
+                `focused changes. Merging is still allowed.`;
+            } else {
+              // Hard threshold: require an approval from a designated approver.
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                owner, repo, pull_number: pr.number,
+              });
+              // Track the latest non-comment review per designated approver
+              // (later reviews overwrite earlier ones); the approval counts
+              // only if that latest state is still APPROVED.
+              const latestState = new Map();
+              for (const r of reviews) {
+                if (r.state === 'COMMENTED') continue;
+                const login = r.user?.login?.toLowerCase();
+                if (login && approvers.has(login)) latestState.set(login, r.state);
+              }
+              const approvedBy = [...latestState]
+                .filter(([, st]) => st === 'APPROVED')
+                .map(([login]) => login);
+
+              if (approvedBy.length > 0) {
+                state = 'success';
+                description =
+                  `${additions} added lines — approved by ${approvedBy.join(', ')}.`;
+                body =
+                  `${marker}\n` +
+                  `### ✅ Large pull request approved\n\n` +
+                  `This PR adds **${additions}** lines ` +
+                  `(threshold: ${hardThreshold}) and has an approving review ` +
+                  `from a designated approver: ${approvedBy.join(', ')}.`;
+              } else {
+                state = 'failure';
+                description =
+                  `${additions} added lines — needs approval from a designated approver.`;
+                const approverList = approvers.size > 0
+                  ? [...approvers].map(a => `\`${a}\``).join(', ')
+                  : '_(approver list not configured)_';
+                body =
+                  `${marker}\n` +
+                  `### 🚫 Large pull request requires senior approval\n\n` +
+                  `This PR adds **${additions}** lines ` +
+                  `(threshold: ${hardThreshold}). It can only be merged after an ` +
+                  `approving review from a designated approver.\n\n` +
+                  `Designated approvers: ${approverList}\n\n` +
+                  `Consider splitting this PR into smaller changes if possible.`;
+              }
+            }
+
+            // --- publish the status check ----------------------------------
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha, state, context: statusContext, description,
+            });
+            console.log(`Status: ${state} — ${description}`);
+
+            // --- upsert / delete the sticky comment ------------------------
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pr.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (body) {
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner, repo, comment_id: existing.id, body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: pr.number, body,
+                });
+              }
+            } else if (existing) {
+              // Dropped back under the warning threshold — clean up.
+              await github.rest.issues.deleteComment({
+                owner, repo, comment_id: existing.id,
+              });
+            }
