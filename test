@@ -1,4 +1,3 @@
-# ── 3b. coreutils: du / df ───────────────────────────────────────────────────
 echo ">>> coreutils (du, df)"
 for tool in du df; do
     bin="$(command -v "$tool" 2>/dev/null || true)"
@@ -7,9 +6,14 @@ for tool in du df; do
         continue
     fi
     real="$(readlink -f "$bin")"
-    # реальный бинарь (например /usr/bin/coreutils) + его .so (для static — пусто)
-    copy_with_deps "$real"
-    # пересоздаём симлинк tool -> real, если tool был симлинком (coreutils-single)
+    mkdir -p "${ROOTFS}$(dirname "$real")"
+    [ -f "${ROOTFS}${real}" ] || cp -p "$real" "${ROOTFS}${real}"
+    echo "  copied ${real}"
+    ldd "$real" 2>/dev/null | awk '/=>/ {print $3} NF==2 && /^\// {print $1}' | while read -r lib; do
+        [ -f "$lib" ] || continue
+        mkdir -p "${ROOTFS}$(dirname "$lib")"
+        [ -f "${ROOTFS}${lib}" ] || cp -p "$lib" "${ROOTFS}${lib}"
+    done
     if [ "$bin" != "$real" ]; then
         mkdir -p "${ROOTFS}$(dirname "$bin")"
         ln -sf "$real" "${ROOTFS}${bin}"
