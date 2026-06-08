@@ -1,11 +1,18 @@
-       96 +echo ">>> du / df (coreutils)"                                                                                                                                                                                                        
-       97 +for tool in du df; do                                                                                                                                                                                                                 
-       98 +    TOOL_BIN="$(which "$tool" 2>/dev/null || true)"                                                                                                                                                                                   
-       99 +    if [ -n "$TOOL_BIN" ]; then                                                                                                                                                                                                       
-      100 +        copy_with_deps "$TOOL_BIN"                                                                                                                                                                                                    
-      101 +        mkdir -p "${ROOTFS}/usr/bin"                                                                                                                                                                                                  
-      102 +        [ -e "${ROOTFS}/usr/bin/${tool}" ] || ln -sf "$(readlink -f "$TOOL_BIN")" "${ROOTFS}/usr/bin/${tool}"                                                                                                                         
-      103 +    else                                                                                                                                                                                                                              
-      104 +        echo "  WARNING: ${tool} not found in builder image"                                                                                                                                                                          
-      105 +    fi                                                                                                                                                                                                                                
-      106 +done  
+# ── 3b. coreutils: du / df ───────────────────────────────────────────────────
+echo ">>> coreutils (du, df)"
+for tool in du df; do
+    bin="$(command -v "$tool" 2>/dev/null || true)"
+    if [ -z "$bin" ]; then
+        echo "  WARNING: ${tool} не найден в билдере"
+        continue
+    fi
+    real="$(readlink -f "$bin")"
+    # реальный бинарь (например /usr/bin/coreutils) + его .so (для static — пусто)
+    copy_with_deps "$real"
+    # пересоздаём симлинк tool -> real, если tool был симлинком (coreutils-single)
+    if [ "$bin" != "$real" ]; then
+        mkdir -p "${ROOTFS}$(dirname "$bin")"
+        ln -sf "$real" "${ROOTFS}${bin}"
+        echo "  symlink ${bin} -> ${real}"
+    fi
+done
