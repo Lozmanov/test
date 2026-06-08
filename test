@@ -1,95 +1,11 @@
-#!/usr/bin/env bash
-#
-# Quorum-safe rolling upgrade чарта Ozone.
-#
-# Каждая реплика OM/SCM/DataNode — отдельный StatefulSet (om-0, om-1, ...),
-# поэтому обычный `helm upgrade` катит все ординалы роли разом и роняет
-# Raft-кворум OM/SCM. Скрипт катит ординалы ПО ОДНОМУ через per-role поле
-# <role>.releaseOrdinal. Гейт между шагами — `kubectl rollout status` нужного
-# STS (readinessProbe пода) плюс пауза STEP_SETTLE_SECONDS на ресинк Raft.
-#
-# Только для апгрейда живого кластера. Первичная установка — обычный
-# `helm upgrade --install` (releaseOrdinal=999 по умолчанию = параллельный bootstrap).
-#
-# Совместим с bash 3.2 (без associative arrays).
-#
-# Конфигурация через env:
-#   NAMESPACE  (обяз.)  namespace
-#   CHART      (обяз.)  чарт .tgz или каталог
-#   VALUES              values-файл(ы) через запятую
-#   RELEASE             имя релиза (по умолчанию ozone)
-#   ROLES               роли и их порядок (по умолчанию "scm om datanode")
-#   STEP_SETTLE_SECONDS пауза между ординалами (по умолчанию 30)
-#   POD_READY_TIMEOUT   таймаут kubectl rollout status (по умолчанию 600s)
-#
-set -euo pipefail
-
-RELEASE="${RELEASE:-ozone}"
-ROLES="${ROLES:-scm om datanode}"
-STEP_SETTLE_SECONDS="${STEP_SETTLE_SECONDS:-30}"
-POD_READY_TIMEOUT="${POD_READY_TIMEOUT:-600s}"
-: "${NAMESPACE:?NAMESPACE не задан}"
-: "${CHART:?CHART не задан}"
-
-log() { echo "[upgrade] $*"; }
-die() { echo "[upgrade] FATAL: $*" >&2; exit 1; }
-
-# values-файлы (через запятую) → массив -f аргументов
-VALUES_ARGS=()
-if [[ -n "${VALUES:-}" ]]; then
-  IFS=',' read -ra _vf <<< "$VALUES"
-  for f in "${_vf[@]}"; do VALUES_ARGS+=("-f" "$f"); done
-fi
-
-# per-role releaseOrdinal в отдельных переменных RO_<role> (без associative
-# arrays — совместимость с bash 3.2). Стартуем «всё заморожено» (-1).
-RO_scm=-1
-RO_om=-1
-RO_datanode=-1
-
-set_ro() { printf -v "RO_$1" '%s' "$2"; }   # set_ro <role> <ordinal>
-get_n()  { local _v="N_$1"; echo "${!_v}"; } # get_n <role> -> число реплик
-
-apply_helm() {
-  # БЕЗ --wait: он ждёт готовности ВСЕГО релиза, а у замороженных STS
-  # (releaseOrdinal=-1, partition=1) updateRevision != currentRevision, и helm
-  # считает релиз вечно «не готовым» → висит в pending. Готовность нужного
-  # ординала ждём отдельно через `kubectl rollout status` (см. wait_ready).
-  helm upgrade --install "$RELEASE" "$CHART" -n "$NAMESPACE" \
-    ${VALUES_ARGS[@]+"${VALUES_ARGS[@]}"} \
-    --set "scm.releaseOrdinal=${RO_scm},om.releaseOrdinal=${RO_om},datanode.releaseOrdinal=${RO_datanode}"
-}
-
-wait_ready() {   # wait_ready <role> <i> — ждём только этот STS
-  local sts="$1-$2"
-  log "ждём rollout statefulset/$sts (timeout $POD_READY_TIMEOUT)"
-  # rollout status partition-aware: завершается, когда под обновлён и Ready.
-  kubectl -n "$NAMESPACE" rollout status "statefulset/$sts" --timeout="$POD_READY_TIMEOUT"
-}
-
-# число STS вида <role>-<n> по ролям → переменные N_<role>
-for role in $ROLES; do
-  cnt="$(kubectl -n "$NAMESPACE" get statefulset -o name 2>/dev/null | grep -Ec "/$role-[0-9]+$" || true)"
-  [[ "$cnt" -gt 0 ]] || die "не найдено STS '$role-*' в ns $NAMESPACE"
-  printf -v "N_$role" '%s' "$cnt"
-  log "роль $role: $cnt реплик"
-done
-
-# walk по ролям, по одному ординалу за раз
-for role in $ROLES; do
-  n="$(get_n "$role")"
-  log "=== $role: катим $n ординалов по одному ==="
-  i=0
-  while [[ "$i" -lt "$n" ]]; do
-    log "--- $role: отпускаем ординал $i ---"
-    set_ro "$role" "$i"
-    apply_helm
-    wait_ready "$role" "$i"
-    log "--- $role-$i: Ready, пауза ${STEP_SETTLE_SECONDS}s на ресинк ---"
-    sleep "$STEP_SETTLE_SECONDS"
-    i=$((i + 1))
-  done
-  set_ro "$role" 999   # роль обновлена целиком — держим отпущенной, пока катим следующие
-done
-
-log "Готово: rolling upgrade завершён по одному ординалу."
+       96 +echo ">>> du / df (coreutils)"                                                                                                                                                                                                        
+       97 +for tool in du df; do                                                                                                                                                                                                                 
+       98 +    TOOL_BIN="$(which "$tool" 2>/dev/null || true)"                                                                                                                                                                                   
+       99 +    if [ -n "$TOOL_BIN" ]; then                                                                                                                                                                                                       
+      100 +        copy_with_deps "$TOOL_BIN"                                                                                                                                                                                                    
+      101 +        mkdir -p "${ROOTFS}/usr/bin"                                                                                                                                                                                                  
+      102 +        [ -e "${ROOTFS}/usr/bin/${tool}" ] || ln -sf "$(readlink -f "$TOOL_BIN")" "${ROOTFS}/usr/bin/${tool}"                                                                                                                         
+      103 +    else                                                                                                                                                                                                                              
+      104 +        echo "  WARNING: ${tool} not found in builder image"                                                                                                                                                                          
+      105 +    fi                                                                                                                                                                                                                                
+      106 +done  
