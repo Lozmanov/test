@@ -5,8 +5,8 @@
 # Каждая реплика OM/SCM/DataNode — отдельный StatefulSet (om-0, om-1, ...),
 # поэтому обычный `helm upgrade` катит все ординалы роли разом и роняет
 # Raft-кворум OM/SCM. Скрипт катит ординалы ПО ОДНОМУ через per-role поле
-# <role>.releaseOrdinal. Гейт между шагами — readinessProbe пода
-# (`helm upgrade --wait`) плюс пауза STEP_SETTLE_SECONDS на ресинк Raft.
+# <role>.releaseOrdinal. Гейт между шагами — `kubectl rollout status` нужного
+# STS (readinessProbe пода) плюс пауза STEP_SETTLE_SECONDS на ресинк Raft.
 #
 # Только для апгрейда живого кластера. Первичная установка — обычный
 # `helm upgrade --install` (releaseOrdinal=999 по умолчанию = параллельный bootstrap).
@@ -20,7 +20,7 @@
 #   RELEASE             имя релиза (по умолчанию ozone)
 #   ROLES               роли и их порядок (по умолчанию "scm om datanode")
 #   STEP_SETTLE_SECONDS пауза между ординалами (по умолчанию 30)
-#   POD_READY_TIMEOUT   таймаут helm --wait (по умолчанию 600s)
+#   POD_READY_TIMEOUT   таймаут kubectl rollout status (по умолчанию 600s)
 #
 set -euo pipefail
 
@@ -51,11 +51,20 @@ set_ro() { printf -v "RO_$1" '%s' "$2"; }   # set_ro <role> <ordinal>
 get_n()  { local _v="N_$1"; echo "${!_v}"; } # get_n <role> -> число реплик
 
 apply_helm() {
-  # --wait блокируется, пока выкаченный под не станет Ready (readinessProbe).
-  # Замороженные ординалы (partition=1) продолжают крутиться на старой ревизии.
+  # БЕЗ --wait: он ждёт готовности ВСЕГО релиза, а у замороженных STS
+  # (releaseOrdinal=-1, partition=1) updateRevision != currentRevision, и helm
+  # считает релиз вечно «не готовым» → висит в pending. Готовность нужного
+  # ординала ждём отдельно через `kubectl rollout status` (см. wait_ready).
   helm upgrade --install "$RELEASE" "$CHART" -n "$NAMESPACE" \
-    ${VALUES_ARGS[@]+"${VALUES_ARGS[@]}"} --wait --timeout "$POD_READY_TIMEOUT" \
+    ${VALUES_ARGS[@]+"${VALUES_ARGS[@]}"} \
     --set "scm.releaseOrdinal=${RO_scm},om.releaseOrdinal=${RO_om},datanode.releaseOrdinal=${RO_datanode}"
+}
+
+wait_ready() {   # wait_ready <role> <i> — ждём только этот STS
+  local sts="$1-$2"
+  log "ждём rollout statefulset/$sts (timeout $POD_READY_TIMEOUT)"
+  # rollout status partition-aware: завершается, когда под обновлён и Ready.
+  kubectl -n "$NAMESPACE" rollout status "statefulset/$sts" --timeout="$POD_READY_TIMEOUT"
 }
 
 # число STS вида <role>-<n> по ролям → переменные N_<role>
@@ -75,6 +84,7 @@ for role in $ROLES; do
     log "--- $role: отпускаем ординал $i ---"
     set_ro "$role" "$i"
     apply_helm
+    wait_ready "$role" "$i"
     log "--- $role-$i: Ready, пауза ${STEP_SETTLE_SECONDS}s на ресинк ---"
     sleep "$STEP_SETTLE_SECONDS"
     i=$((i + 1))
