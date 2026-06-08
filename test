@@ -1,25 +1,85 @@
-        {{- if .Values.om.enabled }}
-        - "./{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        - "./*.{{ .Values.om.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        {{- end }}
-        {{- if .Values.scm.enabled }}
-        - "./{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        - "./*.{{ .Values.scm.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        {{- end }}
-        {{- if .Values.datanode.enabled }}
-        - "./{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        - "./*.{{ .Values.datanode.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        {{- end }}
-        {{- if .Values.recon.enabled }}
-        - "./{{ .Values.recon.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        {{- end }}
-        {{- if .Values.s3g.enabled }}
-        - "./{{ .Values.s3g.serviceName }}-rest.{{ $ns }}.svc.{{ $dom }}"
-        - "./{{ .Values.s3g.serviceName }}-web.{{ $ns }}.svc.{{ $dom }}"
-        {{- end }}
-        {{- if .Values.hue.enabled }}
-        - "./{{ .Values.hue.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        {{- end }}
-        {{- if .Values.hiveMetastore.enabled }}
-        - "./{{ .Values.hiveMetastore.serviceName }}.{{ $ns }}.svc.{{ $dom }}"
-        {{- end }}
+#!/usr/bin/env bash
+#
+# Quorum-safe rolling upgrade чарта Ozone.
+#
+# Каждая реплика OM/SCM/DataNode — отдельный StatefulSet (om-0, om-1, ...),
+# поэтому обычный `helm upgrade` катит все ординалы роли разом и роняет
+# Raft-кворум OM/SCM. Скрипт катит ординалы ПО ОДНОМУ через per-role поле
+# <role>.releaseOrdinal. Гейт между шагами — readinessProbe пода
+# (`helm upgrade --wait`) плюс пауза STEP_SETTLE_SECONDS на ресинк Raft.
+#
+# Только для апгрейда живого кластера. Первичная установка — обычный
+# `helm upgrade --install` (releaseOrdinal=999 по умолчанию = параллельный bootstrap).
+#
+# Совместим с bash 3.2 (без associative arrays).
+#
+# Конфигурация через env:
+#   NAMESPACE  (обяз.)  namespace
+#   CHART      (обяз.)  чарт .tgz или каталог
+#   VALUES              values-файл(ы) через запятую
+#   RELEASE             имя релиза (по умолчанию ozone)
+#   ROLES               роли и их порядок (по умолчанию "scm om datanode")
+#   STEP_SETTLE_SECONDS пауза между ординалами (по умолчанию 30)
+#   POD_READY_TIMEOUT   таймаут helm --wait (по умолчанию 600s)
+#
+set -euo pipefail
+
+RELEASE="${RELEASE:-ozone}"
+ROLES="${ROLES:-scm om datanode}"
+STEP_SETTLE_SECONDS="${STEP_SETTLE_SECONDS:-30}"
+POD_READY_TIMEOUT="${POD_READY_TIMEOUT:-600s}"
+: "${NAMESPACE:?NAMESPACE не задан}"
+: "${CHART:?CHART не задан}"
+
+log() { echo "[upgrade] $*"; }
+die() { echo "[upgrade] FATAL: $*" >&2; exit 1; }
+
+# values-файлы (через запятую) → массив -f аргументов
+VALUES_ARGS=()
+if [[ -n "${VALUES:-}" ]]; then
+  IFS=',' read -ra _vf <<< "$VALUES"
+  for f in "${_vf[@]}"; do VALUES_ARGS+=("-f" "$f"); done
+fi
+
+# per-role releaseOrdinal в отдельных переменных RO_<role> (без associative
+# arrays — совместимость с bash 3.2). Стартуем «всё заморожено» (-1).
+RO_scm=-1
+RO_om=-1
+RO_datanode=-1
+
+set_ro() { printf -v "RO_$1" '%s' "$2"; }   # set_ro <role> <ordinal>
+get_n()  { local _v="N_$1"; echo "${!_v}"; } # get_n <role> -> число реплик
+
+apply_helm() {
+  # --wait блокируется, пока выкаченный под не станет Ready (readinessProbe).
+  # Замороженные ординалы (partition=1) продолжают крутиться на старой ревизии.
+  helm upgrade --install "$RELEASE" "$CHART" -n "$NAMESPACE" \
+    ${VALUES_ARGS[@]+"${VALUES_ARGS[@]}"} --wait --timeout "$POD_READY_TIMEOUT" \
+    --set "scm.releaseOrdinal=${RO_scm},om.releaseOrdinal=${RO_om},datanode.releaseOrdinal=${RO_datanode}"
+}
+
+# число STS вида <role>-<n> по ролям → переменные N_<role>
+for role in $ROLES; do
+  cnt="$(kubectl -n "$NAMESPACE" get statefulset -o name 2>/dev/null | grep -Ec "/$role-[0-9]+$" || true)"
+  [[ "$cnt" -gt 0 ]] || die "не найдено STS '$role-*' в ns $NAMESPACE"
+  printf -v "N_$role" '%s' "$cnt"
+  log "роль $role: $cnt реплик"
+done
+
+# walk по ролям, по одному ординалу за раз
+for role in $ROLES; do
+  n="$(get_n "$role")"
+  log "=== $role: катим $n ординалов по одному ==="
+  i=0
+  while [[ "$i" -lt "$n" ]]; do
+    log "--- $role: отпускаем ординал $i ---"
+    set_ro "$role" "$i"
+    apply_helm
+    log "--- $role-$i: Ready, пауза ${STEP_SETTLE_SECONDS}s на ресинк ---"
+    sleep "$STEP_SETTLE_SECONDS"
+    i=$((i + 1))
+  done
+  set_ro "$role" 999   # роль обновлена целиком — держим отпущенной, пока катим следующие
+done
+
+log "Готово: rolling upgrade завершён по одному ординалу."
