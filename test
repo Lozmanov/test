@@ -1,11 +1,8 @@
-echo ">>> coreutils (du, df)"
-for tool in du df; do
-    bin="$(command -v "$tool" 2>/dev/null || true)"
-    if [ -z "$bin" ]; then
-        echo "  WARNING: ${tool} не найден в билдере"
-        continue
-    fi
-    real="$(readlink -f "$bin")"
+# ── 3c. bash (для отладки: kubectl exec в scratch-под) ───────────────────────
+echo ">>> bash"
+BASH_BIN="$(command -v bash 2>/dev/null || true)"
+if [ -n "$BASH_BIN" ]; then
+    real="$(readlink -f "$BASH_BIN")"
     mkdir -p "${ROOTFS}$(dirname "$real")"
     [ -f "${ROOTFS}${real}" ] || cp -p "$real" "${ROOTFS}${real}"
     echo "  copied ${real}"
@@ -13,10 +10,11 @@ for tool in du df; do
         [ -f "$lib" ] || continue
         mkdir -p "${ROOTFS}$(dirname "$lib")"
         [ -f "${ROOTFS}${lib}" ] || cp -p "$lib" "${ROOTFS}${lib}"
+    done || true
+    # удобные точки входа: /bin/bash и /usr/bin/bash → реальный бинарь
+    for p in /bin/bash /usr/bin/bash; do
+        [ -e "${ROOTFS}${p}" ] || { mkdir -p "${ROOTFS}$(dirname "$p")"; ln -sf "$real" "${ROOTFS}${p}"; }
     done
-    if [ "$bin" != "$real" ]; then
-        mkdir -p "${ROOTFS}$(dirname "$bin")"
-        ln -sf "$real" "${ROOTFS}${bin}"
-        echo "  symlink ${bin} -> ${real}"
-    fi
-done
+else
+    echo "  WARNING: bash не найден в билдере"
+fi
