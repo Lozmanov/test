@@ -1,1 +1,354 @@
+{{- if .Values.hiveMetastore.enabled }}
+{{- $vaultNeeded := and .Values.secman.enabled (or .Values.global.security.kerberos.enabled .Values.hiveMetastore.secman.dbPasswordKey) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.hiveMetastore.serviceName }}
+  namespace: {{ include "ozone.namespace" . }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: hive-metastore
+spec:
+  replicas: {{ .Values.hiveMetastore.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ozone.selectorLabels" . | nindent 6 }}
+      component: {{ .Values.hiveMetastore.component }}
+  template:
+    metadata:
+      labels:
+        {{- include "ozone.selectorLabels" . | nindent 8 }}
+        {{- if $vaultNeeded }}
+        {{- include "ozone.secmanLabels" . | nindent 8 }}
+        {{- end }}
+        component: {{ .Values.hiveMetastore.component }}
+      annotations:
+        checksum/ozone-config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        checksum/hive-config: {{ include (print $.Template.BasePath "/hivemetastore/configmap.yaml") $ | sha256sum }}
+        {{- include "ozone.istioAnnotations" $ | nindent 8 }}
+        {{- if $vaultNeeded }}
+        {{- include "ozone.secmanAnnotations" $ | nindent 8 }}
+        {{- include "ozone.kerberosAnnotations" (dict "ctx" $ "component" "hms") | nindent 8 }}
+        {{- if $.Values.hiveMetastore.secman.dbPasswordKey }}
+        vault.hashicorp.com/agent-inject-secret-db-password: 'true'
+        vault.hashicorp.com/agent-inject-template-db-password: |
+          {{`{{- with secret `}}"{{ $.Values.secman.path }}"{{` -}}`}}
+          {{`{{ .Data.`}}{{ $.Values.hiveMetastore.secman.dbPasswordKey }}{{` }}`}}
+          {{`{{- end }}`}}
+        vault.hashicorp.com/agent-inject-perms-db-password: '0444'
+        {{- end }}
+        {{- end }}
+    spec:
+      {{- include "ozone.podSecurityContext" $ | nindent 6 }}
+      serviceAccountName: default
+      automountServiceAccountToken: false
+      {{- with $.Values.global.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        {{- if $.Values.fluentBit.enabled }}
+        {{- include "ozone.fluentbit.container" (dict "ctx" $ "component" "hivemetastore") | nindent 8 }}
+        {{- end }}
+        - name: hivemetastore
+          image: "{{ coalesce $.Values.hiveMetastore.image.registry $.Values.global.image.registry }}/{{ $.Values.hiveMetastore.image.repository }}:{{ $.Values.hiveMetastore.image.tag }}"
+          {{- include "ozone.containerSecurityContext" $ | nindent 10 }}
+          imagePullPolicy: Always
+          env:
+            - name: SERVICE_NAME
+              value: metastore
+            - name: HIVE_CONF_DIR
+              value: /opt/hive/conf
+            - name: HADOOP_CONF_DIR
+              value: /opt/hive/conf
+            - name: DB_DRIVER
+              value: postgres
+            # log4j.configurationFile задаём всегда (фильтр шума TThreadPoolServer-
+            # проб нужен и без fluent-bit); hadoop.log.dir/file — только при
+            # fluent-bit, их читает file-аппендер конфига (см. configmap.yaml).
+            - name: HADOOP_OPTS
+              value: "-Dlog4j.configurationFile=/opt/hive/conf/metastore-log4j2.properties{{ if $.Values.fluentBit.enabled }} -Dhadoop.log.dir={{ $.Values.fluentBit.logDir }} -Dhadoop.log.file=hivemetastore.log{{ end }}"
+            {{- if and $.Values.secman.enabled $.Values.hiveMetastore.secman.dbPasswordKey }}
+            - name: DB_PASSWORD_FILE
+              value: /vault/secrets/db-password
+            {{- else }}
+            - name: DB_PASSWORD
+              value: {{ $.Values.hiveMetastore.database.password | quote }}
+            {{- end }}
+            {{- if $.Values.global.security.kerberos.enabled }}
+            - name: KERBEROS_ENABLED
+              value: "true"
+            - name: KERBEROS_PRINCIPAL
+              {{- $hmsFqdn := printf "%s.%s.svc.%s" $.Values.hiveMetastore.serviceName (include "ozone.namespace" $ ) $.Values.global.clusterDomain }}
+              value: {{ printf "hive/%s@%s" $hmsFqdn $.Values.global.security.kerberos.realm | quote }}
+            - name: KERBEROS_KEYTAB_FILE
+              value: {{ printf "%s/hms.keytab" $.Values.global.security.kerberos.keytabDir | quote }}
+            - name: KERBEROS_VAULT_B64_FILE
+              value: "/vault/secrets/hms-keytab-b64"
+            - name: KERBEROS_WAIT_TIMEOUT
+              value: {{ $.Values.global.security.kerberos.wait.timeout | quote }}
+            - name: KERBEROS_WAIT_INTERVAL
+              value: {{ $.Values.global.security.kerberos.wait.interval | quote }}
+            {{- end }}
+          ports:
+            - name: thrift
+              containerPort: {{ $.Values.hiveMetastore.service.thriftPort }}
+              protocol: TCP
+          volumeMounts:
+            - name: hive-conf
+              mountPath: /opt/hive/conf
+            {{- if $.Values.fluentBit.enabled }}
+            {{- include "ozone.fluentbit.logsMount" $ | nindent 12 }}
+            {{- end }}
+            {{- include "ozone.writableTmpMount" $ | nindent 12 }}
+            {{- if $.Values.global.security.kerberos.enabled }}
+            - name: keytabs
+              mountPath: {{ $.Values.global.security.kerberos.keytabDir }}
+            {{- end }}
+            {{- include "ozone.krb5VolumeMount" $ | nindent 12 }}
+            {{- if $vaultNeeded }}
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ $.Values.hiveMetastore.service.thriftPort }}
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 5
+          readinessProbe:
+            tcpSocket:
+              port: {{ $.Values.hiveMetastore.service.thriftPort }}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          {{- with $.Values.hiveMetastore.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
 
+      volumes:
+        {{- include "ozone.writableTmpVolume" $ | nindent 8 }}
+        - name: hive-conf
+          projected:
+            defaultMode: 256
+            sources:
+              - configMap:
+                  name: {{ include "ozone.fullname" $ }}-config
+              - configMap:
+                  name: {{ include "ozone.fullname" $ }}-hivemetastore-config
+        {{- if $.Values.global.security.kerberos.enabled }}
+        - name: keytabs
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ $.Values.global.security.kerberos.keytabSizeLimit }}
+        {{- end }}
+        {{- if $.Values.fluentBit.enabled }}
+        {{- include "ozone.fluentbit.volumes" $ | nindent 8 }}
+        {{- end }}
+        {{- include "ozone.krb5Volume" $ | nindent 8 }}
+        {{- if $vaultNeeded }}
+        - name: kube-api-access
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        {{- end }}
+{{- end }}
+
+
+
+
+
+
+
+{{- if .Values.hiveMetastore.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ozone.fullname" . }}-hivemetastore-config
+  namespace: {{ include "ozone.namespace" . }}
+  labels:
+    {{- include "ozone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: hive-metastore
+data:
+  # log4j2 для HiveMetaStore. Грузится через -Dlog4j.configurationFile в
+  # HADOOP_OPTS (см. deployment.yaml) — hive-entrypoint сам log4j не настраивает.
+  # Гасит шум kubelet-проб: tcpSocket открывает Thrift-порт и закрывает без SASL,
+  # TThreadPoolServer пишет ERROR на каждую пробу — RegexFilter дропает только это
+  # сообщение. Формат строки трогать осторожно: %d{ISO8601} нужен firstline-
+  # регекспу multiline-парсера fluent-bit, а %c{2} даёт 'HiveMetaStore.audit',
+  # по которому enrich.lua (promote_hms) поднимает аудит в type_id=Audit.
+  metastore-log4j2.properties: |-
+    status = WARN
+    name = HMSLog4j2
+    {{- if .Values.fluentBit.enabled }}
+
+    # log.dir/log.file задаёт deployment (-Dhadoop.log.dir/-Dhadoop.log.file);
+    # fluent-bit тейлит этот файл.
+    property.log.dir  = ${sys:hadoop.log.dir:-/tmp}
+    property.log.file = ${sys:hadoop.log.file:-hivemetastore.log}
+
+    appenders = file
+
+    appender.file.type = RollingFile
+    appender.file.name = file
+    appender.file.fileName = ${log.dir}/${log.file}
+    appender.file.filePattern = ${log.dir}/${log.file}.%d{yyyy-MM-dd}
+    appender.file.layout.type = PatternLayout
+    appender.file.layout.pattern = %d{ISO8601} %-5p [%t] %c{2}: %m%n
+    appender.file.policies.type = Policies
+    appender.file.policies.time.type = TimeBasedTriggeringPolicy
+    appender.file.policies.time.interval = 1
+    appender.file.strategy.type = DefaultRolloverStrategy
+    appender.file.strategy.max = 7
+    {{- else }}
+
+    appenders = console
+
+    appender.console.type = Console
+    appender.console.name = console
+    appender.console.target = SYSTEM_OUT
+    appender.console.layout.type = PatternLayout
+    appender.console.layout.pattern = %d{ISO8601} %-5p [%t] %c{2}: %m%n
+    {{- end }}
+
+    loggers = thrift
+    logger.thrift.name = org.apache.thrift.server.TThreadPoolServer
+    logger.thrift.level = INFO
+    logger.thrift.filter.probe.type = RegexFilter
+    logger.thrift.filter.probe.regex = (?i).*thrift error occurred during processing of message.*
+    logger.thrift.filter.probe.onMatch = DENY
+    logger.thrift.filter.probe.onMismatch = NEUTRAL
+
+    rootLogger.level = ${sys:hive.log.level:-INFO}
+    {{- if .Values.fluentBit.enabled }}
+    rootLogger.appenderRef.file.ref = file
+    {{- else }}
+    rootLogger.appenderRef.console.ref = console
+    {{- end }}
+  hive-site.xml: |-
+    <?xml version="1.0" encoding="UTF-8"?>
+    <?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
+    <configuration>
+
+      <!-- PostgreSQL Backend -->
+      <property>
+        <name>javax.jdo.option.ConnectionDriverName</name>
+        <value>org.postgresql.Driver</value>
+      </property>
+      <property>
+        <name>javax.jdo.option.ConnectionURL</name>
+        <value>jdbc:postgresql://{{ required "hiveMetastore.database.host is required" .Values.hiveMetastore.database.host }}:{{ .Values.hiveMetastore.database.port }}/{{ .Values.hiveMetastore.database.name }}?currentSchema={{ .Values.hiveMetastore.database.user }}</value>
+      </property>
+      <property>
+        <name>javax.jdo.option.ConnectionUserName</name>
+        <value>{{ .Values.hiveMetastore.database.user }}</value>
+      </property>
+      <property>
+        <name>javax.jdo.option.ConnectionPassword</name>
+        <value>${env.DB_PASSWORD}</value>
+      </property>
+
+      <!-- Warehouse Directories on Ozone OFS -->
+      <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>{{ tpl .Values.hiveMetastore.warehouse.dir $ }}</value>
+      </property>
+      <property>
+        <name>hive.metastore.warehouse.external.dir</name>
+        <value>{{ tpl .Values.hiveMetastore.warehouse.externalDir $ }}</value>
+      </property>
+
+      <!-- Metastore Thrift Service -->
+      <property>
+        <name>hive.metastore.port</name>
+        <value>{{ .Values.hiveMetastore.service.thriftPort }}</value>
+      </property>
+      <property>
+        <name>hive.metastore.uris</name>
+        <value>thrift://{{ include "ozone.hivemetastore.fqdn" . }}:{{ .Values.hiveMetastore.service.thriftPort }}</value>
+      </property>
+
+      <!-- Schema Management (managed via schematool init container) -->
+      <property>
+        <name>datanucleus.autoCreateSchema</name>
+        <value>false</value>
+      </property>
+      <property>
+        <name>datanucleus.fixedDatastore</name>
+        <value>false</value>
+      </property>
+      <property>
+        <name>datanucleus.autoCreateTables</name>
+        <value>false</value>
+      </property>
+
+      <!-- Event notifications (required for replication / Ranger audits) -->
+      <property>
+        <name>hive.metastore.transactional.event.listeners</name>
+        <value>org.apache.hive.hcatalog.listener.DbNotificationListener</value>
+      </property>
+      <property>
+        <name>hive.metastore.event.db.notification.api.auth</name>
+        <value>false</value>
+      </property>
+
+      <!-- Statistics -->
+      <property>
+        <name>hive.stats.autogather</name>
+        <value>true</value>
+      </property>
+
+      {{- if .Values.global.security.kerberos.enabled }}
+      {{- $hmsFqdn := printf "%s.%s.svc.%s" .Values.hiveMetastore.serviceName (include "ozone.namespace" .) .Values.global.clusterDomain }}
+      <!-- Kerberos: HMS -->
+      <property>
+        <name>hive.metastore.sasl.enabled</name>
+        <value>true</value>
+      </property>
+      <property>
+        <name>hive.metastore.kerberos.principal</name>
+        <value>hive/{{ $hmsFqdn }}@{{ .Values.global.security.kerberos.realm }}</value>
+      </property>
+      <property>
+        <name>hive.metastore.kerberos.keytab.file</name>
+        <value>{{ .Values.global.security.kerberos.keytabDir }}/hms.keytab</value>
+      </property>
+      <property>
+        <name>hive.metastore.execute.setugi</name>
+        <value>true</value>
+      </property>
+      <property>
+        <name>hive.metastore.pre.event.listeners</name>
+        <value>org.apache.hadoop.hive.ql.security.authorization.AuthorizationPreEventListener</value>
+      </property>
+      <property>
+        <name>metastore.expression.proxy</name>
+        <value>org.apache.hadoop.hive.ql.optimizer.ppr.PartitionExpressionForMetastore</value>
+      </property>
+      <property>
+        <name>hive.security.metastore.authorization.manager</name>
+        <value>org.apache.hadoop.hive.ql.security.authorization.StorageBasedAuthorizationProvider</value>
+      </property>
+      {{- end }}
+
+      <property>
+        <name>hive.metastore.schema.owner</name>
+        <value>as_admin</value>
+      </property>
+    </configuration>
+{{- end }}
