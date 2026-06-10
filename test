@@ -1,1 +1,352 @@
 
+#!/usr/bin/env python3
+"""
+Helm chart patcher for production deployments.
+
+Replaces Helm template expressions with hardcoded values resolved from
+a specified values file. Produces a patched Helm chart as tar.gz.
+
+Usage:
+    python3 scripts/patch-helm-chart.py [options]
+
+    # Patch with default IFT values:
+    python3 scripts/patch-helm-chart.py
+
+    # Use a different values file:
+    python3 scripts/patch-helm-chart.py --values-file values/values-prod.yaml
+
+    # Custom output name:
+    python3 scripts/patch-helm-chart.py --output-name ozone-1.4.1-prod
+"""
+
+import argparse
+import re
+import shutil
+import sys
+import tarfile
+import textwrap
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """Deep merge two dicts; override takes precedence."""
+    result = dict(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def get_nested(data: dict, path: str) -> Any:
+    """Get value from nested dict using dot-notation path."""
+    parts = path.split('.')
+    current = data
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            raise KeyError(f"path '{path}' (missing key '{part}')")
+        current = current[part]
+    return current
+
+
+_HELM_VALUE_RE = re.compile(r'\{\{\s*[.$]+Values\.([a-zA-Z0-9_.]+)\s*\}\}')
+
+
+def resolve_tpl(value: Any, all_values: dict, depth: int = 0) -> str:
+    """
+    Resolve {{ .Values.x.y.z }} / {{ $.Values.x.y.z }} references recursively.
+    Mimics Helm's tpl function for simple value substitutions.
+    """
+    if depth > 8:
+        return str(value)
+    s = str(value)
+
+    def _replace(m) -> str:
+        try:
+            resolved = get_nested(all_values, m.group(1))
+            return resolve_tpl(resolved, all_values, depth + 1)
+        except KeyError:
+            return m.group(0)
+
+    return _HELM_VALUE_RE.sub(_replace, s)
+
+
+_FMT_RE = re.compile(r'\{([a-zA-Z0-9_.| ]+)\}')
+
+
+def resolve_format(template: str, all_values: dict) -> str:
+    """
+    Resolve {path.to.value} placeholders in a replacement template string.
+    Each value is tpl-resolved to expand any {{ .Values.* }} references within it.
+
+    Supports coalesce syntax: {path1 || path2} — first non-empty value wins.
+    This mirrors Helm's {{ coalesce .Values.X .Values.Y }} function.
+    Example: {hue.image.registry || global.image.registry}
+    """
+    def _replace(m) -> str:
+        paths = [p.strip() for p in m.group(1).split('||')]
+        for path in paths:
+            try:
+                raw = get_nested(all_values, path)
+                resolved = resolve_tpl(raw, all_values)
+                if resolved:
+                    return resolved
+            except KeyError:
+                continue
+        return ''
+
+    return _FMT_RE.sub(_replace, template)
+
+
+def yaml_value_replacement(key: str, prefix: str, indent: int, all_values: dict) -> str:
+    """
+    Build a static YAML block to replace a Helm include expression.
+
+    Generates:
+        {indent spaces}{prefix}
+        {indent+2 spaces}{yaml field 1}
+        {indent+2 spaces}{yaml field 2}
+        ...
+
+    This mirrors what Helm produces with:
+        {{- define "helper" -}}
+        {prefix}
+          {{- toYaml .Values.{key} | nindent 2 }}
+        {{- end -}}
+    piped through | nindent {indent}.
+    """
+    value = get_nested(all_values, key)
+    yaml_str = yaml.dump(value, default_flow_style=False).rstrip()
+
+    pad = ' ' * indent
+    child_pad = ' ' * (indent + 2)
+
+    lines = [f"{pad}{prefix}"]
+    for line in yaml_str.splitlines():
+        lines.append(f"{child_pad}{line}")
+    return '\n'.join(lines)
+
+
+def resolve_replacement(patch: dict, all_values: dict) -> str:
+    """Resolve a patch's replacement field to its final string value."""
+    repl = patch['replacement']
+
+    if isinstance(repl, str):
+        return resolve_format(repl, all_values)
+
+    if isinstance(repl, dict):
+        rtype = repl.get('type', 'format')
+
+        if rtype == 'format':
+            return resolve_format(repl['format'], all_values)
+
+        if rtype == 'yaml_value':
+            return yaml_value_replacement(
+                key=repl['key'],
+                prefix=repl.get('prefix', ''),
+                indent=repl.get('indent', 0),
+                all_values=all_values,
+            )
+
+        if rtype == 'literal':
+            return repl['value']
+
+        raise ValueError(f"unknown replacement type: {rtype!r}")
+
+    raise ValueError(f"unexpected replacement type: {type(repl).__name__}")
+
+
+def remove_paths(chart_dir: Path, patterns: list) -> int:
+    """
+    Delete files/directories matching the given glob patterns from chart_dir.
+
+    Used to strip optional components from the release artifact entirely
+    (e.g. hue, recon must not ship in the production distributive), rather than
+    only disabling them via values. Patterns are globs relative to the chart
+    root, same convention as a patch's `files`. Returns the number of paths
+    removed.
+    """
+    removed = 0
+    for pattern in patterns:
+        matched = sorted(chart_dir.glob(pattern))
+        if not matched:
+            print(f"  [WARN] remove: no paths matched {pattern!r}")
+            continue
+        for path in matched:
+            rel = path.relative_to(chart_dir)
+            if path.is_dir():
+                shutil.rmtree(path)
+                print(f"  [DEL]  {rel}/ (directory)")
+            else:
+                path.unlink()
+                print(f"  [DEL]  {rel}")
+            removed += 1
+    return removed
+
+
+def apply_patches(chart_dir: Path, patches: list, all_values: dict) -> int:
+    """Apply all patch rules to chart_dir. Returns total replacement count."""
+    total = 0
+
+    for patch in patches:
+        name = patch.get('name', '(unnamed)')
+
+        files_patterns = patch.get('files', [])
+        if isinstance(files_patterns, str):
+            files_patterns = [files_patterns]
+
+        search = patch['search']
+
+        try:
+            replacement = resolve_replacement(patch, all_values)
+        except (KeyError, ValueError) as exc:
+            print(f"  [SKIP] '{name}': cannot resolve replacement — {exc}", file=sys.stderr)
+            continue
+
+        matched = []
+        for pattern in files_patterns:
+            matched.extend(sorted(chart_dir.glob(pattern)))
+
+        if not matched:
+            print(f"  [WARN] '{name}': no files matched {files_patterns}")
+            continue
+
+        for fpath in matched:
+            content = fpath.read_text()
+            count = content.count(search)
+            if count:
+                fpath.write_text(content.replace(search, replacement))
+                total += count
+                rel = fpath.relative_to(chart_dir)
+                print(f"  [OK]   '{name}' — {rel} ({count}x)")
+            else:
+                rel = fpath.relative_to(chart_dir)
+                print(f"  [MISS] '{name}' — pattern not found in {rel}")
+
+    return total
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Patch Helm chart templates for production deployment',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Patch rules are defined in the patches config file (YAML).
+            Each rule specifies which files to patch, the exact Helm template
+            expression to find, and how to compute the replacement value.
+
+            Replacement types:
+              String with {path.to.value}  — resolved from merged values (tpl-aware)
+              type: yaml_value             — renders a values subtree as a YAML block
+              type: literal                — exact literal text, no substitution
+
+            Examples:
+              python3 scripts/patch-helm-chart.py
+              python3 scripts/patch-helm-chart.py --values-file values/values-prod.yaml
+              python3 scripts/patch-helm-chart.py --output-name ozone-1.4.1-prod
+        """),
+    )
+    parser.add_argument(
+        '--chart-dir', default='helm-charts/ozone',
+        help='Path to helm chart directory (default: helm-charts/ozone)',
+    )
+    parser.add_argument(
+        '--values-file', default='values/values-ift.yaml',
+        help='Values override file for resolving replacements (default: values/values-ift.yaml)',
+    )
+    parser.add_argument(
+        '--patches-config', default='scripts/patches.yaml',
+        help='Patch rules configuration file (default: scripts/patches.yaml)',
+    )
+    parser.add_argument(
+        '--output-dir', default='dist',
+        help='Output directory for the generated artifact (default: dist)',
+    )
+    parser.add_argument(
+        '--output-name', default=None,
+        help='Output archive name without .tar.gz (default: {chart-name}-prod)',
+    )
+    args = parser.parse_args()
+
+    chart_dir = Path(args.chart_dir)
+    if not chart_dir.is_dir():
+        print(f"error: chart directory not found: {chart_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load and deep-merge values: base values.yaml + override file
+    base_values_path = chart_dir / 'values.yaml'
+    with open(base_values_path) as f:
+        all_values: dict = yaml.safe_load(f) or {}
+
+    if args.values_file:
+        override_path = Path(args.values_file)
+        if not override_path.is_file():
+            print(f"error: values file not found: {override_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(override_path) as f:
+            override_values: dict = yaml.safe_load(f) or {}
+        all_values = deep_merge(all_values, override_values)
+        print(f"Values  : {base_values_path} + {override_path}")
+    else:
+        print(f"Values  : {base_values_path}")
+
+    # Load patch rules
+    patches_path = Path(args.patches_config)
+    if not patches_path.is_file():
+        print(f"error: patches config not found: {patches_path}", file=sys.stderr)
+        sys.exit(1)
+    with open(patches_path) as f:
+        patches_cfg: dict = yaml.safe_load(f) or {}
+    patches: list = patches_cfg.get('patches', [])
+    remove: list = patches_cfg.get('remove', [])
+    print(f"Patches : {len(patches)} rules from {patches_path}")
+    if remove:
+        print(f"Remove  : {len(remove)} path patterns")
+    print()
+
+    # Copy chart to a temporary work directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = output_dir / '.patch-work'
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    shutil.copytree(str(chart_dir), str(work_dir / chart_dir.name))
+    work_chart_dir = work_dir / chart_dir.name
+
+    # Apply patches
+    total = apply_patches(work_chart_dir, patches, all_values)
+    print(f"\nTotal replacements: {total}")
+
+    # Strip excluded paths from the artifact (e.g. hue, recon)
+    if remove:
+        print("\nRemoving excluded paths:")
+        removed = remove_paths(work_chart_dir, remove)
+        print(f"\nTotal paths removed: {removed}")
+
+    # Package as tgz (same format as helm package)
+    output_name = args.output_name or f"{chart_dir.name}-prod"
+    output_path = output_dir / f"{output_name}.tgz"
+
+    with tarfile.open(str(output_path), 'w:gz') as tar:
+        tar.add(str(work_chart_dir), arcname=chart_dir.name)
+
+    shutil.rmtree(work_dir)
+    print(f"Artifact: {output_path}")
+
+
+if __name__ == '__main__':
+    main()
+
+
+remove:
+  - templates/hue
+  - templates/recon
+
+
+
+
+
