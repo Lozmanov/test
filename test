@@ -1,1 +1,19 @@
 
+  - name: hadoop.security.authentication mode
+    files:
+      - values.yaml
+    search: '          <value>{{ if .Values.global.security.kerberos.enabled }}kerberos{{ else }}simple{{ end }}</value>'
+    replacement:
+      type: conditional
+      key: global.security.kerberos.enabled
+      when_true: '          <value>kerberos</value>'
+      when_false: '          <valu
+
+
+
+        if rtype == 'conditional':
+            raw = get_nested(all_values, repl['key'])
+            branch = repl['when_true'] if raw else repl['when_false']
+            return resolve_format(branch, all_values)
+
+              type: conditional            — picks when_true/when_false by a bool value
