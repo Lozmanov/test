@@ -1,5 +1,5 @@
 
-  - name: hadoop.security.authentication mode
+- name: hadoop.security.authentication mode
     files:
       - values.yaml
     search: '          <value>{{ if .Values.global.security.kerberos.enabled }}kerberos{{ else }}simple{{ end }}</value>'
@@ -7,7 +7,7 @@
       type: conditional
       key: global.security.kerberos.enabled
       when_true: '          <value>kerberos</value>'
-      when_false: '          <valu
+      when_false: '          <value>simple</value>'
 
 
 
