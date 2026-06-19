@@ -1,28 +1,29 @@
-  # 2) есть ли у датанода istio-sidecar (иначе он не mesh-эндпоинт)?
-  DN=$(kubectl -n $NS get pod -l component=datanode -o jsonpath='{.items[0].metadata.name}')
-  echo "--- datanode $DN containers ---"
-  kubectl -n $NS get pod $DN -o jsonpath='{.spec.containers[*].name}{"\n"}'
+  NS=dev-lozmanov
+  PROM=$(kubectl -n $NS get pod -l component=prometheus -o jsonpath='{.items[0].metadata.name}')
 
-  # 3) подтверждение режима (block_all = REGISTRY_ONLY)
-  kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET config_dump 2>/dev/null \
-    | grep -ioE "block_all|allow_any" | sort -u
-  EOF)
-  ⎿  # подставь namespace ozone в NS
-     NS=<ozone-ns>
+  # 1) Статус всех таргетов: job / scrapeUrl / health / ошибка
+  kubectl -n $NS exec $PROM -c prometheus -- wget -qO- 'http://localhost:9090/api/v1/targets?state=active' \
+    | python3 -c 'import sys,json; [print(f"{t[\"labels\"].get(\"job\"):16} {t[\"health\"]:5} {t[\"scrapeUrl\"]:45} {t[\"lastError\"][:60]}") for t in json.load(sys.stdin)["data"]["activeTargets"]]'
+
+  echo "=== есть ли вообще cluster на |9882| (headless datanode http) ==="
+  kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET clusters 2>/dev/null \
+    | grep -oE 'outbound\|9882\|[^:]*' | sort -u
+
+  echo "=== для сравнения: cluster на recon http-порт 9888 (ClusterIP) ==="
+  kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET clusters 2>/dev/null \
+    | grep -oE 'outbound\|9888\|[^:]*' | sort -u
+  SCRIPT)
+  ⎿  NS=dev-lozmanov
      PROM=$(kubectl -n $NS get pod -l component=prometheus -o jsonpath='{.items[0].metadata.name}')
-     echo "PROM=$PROM"
 
-     # 1) есть ли вообще outbound-кластер/листенер на 9882?
-     kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET clusters 2>/dev/null | grep -E "9882|datanode" | head
-     echo "--- listeners 9882 ---"
-     kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET config_dump 2>/dev/null \
-       | grep -oE '"(0\.0\.0\.0|29\.64\.18\.190)_9882"' | sort -u
+     # 1) Статус всех таргетов: job / scrapeUrl / health / ошибка
+     kubectl -n $NS exec $PROM -c prometheus -- wget -qO- 'http://localhost:9090/api/v1/targets?state=active' \
+       | python3 -c 'import sys,json; [print(f"{t[\"labels\"].get(\"job\"):16} {t[\"health\"]:5} {t[\"scrapeUrl\"]:45} {t[\"lastError\"][:60]}") for t in json.load(sys.stdin)["data"]["activeTargets"]]'
 
-     # 2) есть ли у датанода istio-sidecar (иначе он не mesh-эндпоинт)?
-     DN=$(kubectl -n $NS get pod -l component=datanode -o jsonpath='{.items[0].metadata.name}')
-     echo "--- datanode $DN containers ---"
-     kubectl -n $NS get pod $DN -o jsonpath='{.spec.containers[*].name}{"\n"}'
+     echo "=== есть ли вообще cluster на |9882| (headless datanode http) ==="
+     kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET clusters 2>/dev/null \
+       | grep -oE 'outbound\|9882\|[^:]*' | sort -u
 
-     # 3) подтверждение режима (block_all = REGISTRY_ONLY)
-     kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET config_dump 2>/dev/null \
-       | grep -ioE "block_all|allow_any" | sort -u
+     echo "=== для сравнения: cluster на recon http-порт 9888 (ClusterIP) ==="
+     kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET clusters 2>/dev/null \
+       | grep -oE 'outbound\|9888\|[^:]*' | sort -u
