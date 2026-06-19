@@ -1,19 +1,28 @@
+  # 2) есть ли у датанода istio-sidecar (иначе он не mesh-эндпоинт)?
+  DN=$(kubectl -n $NS get pod -l component=datanode -o jsonpath='{.items[0].metadata.name}')
+  echo "--- datanode $DN containers ---"
+  kubectl -n $NS get pod $DN -o jsonpath='{.spec.containers[*].name}{"\n"}'
 
-- name: hadoop.security.authentication mode
-    files:
-      - values.yaml
-    search: '          <value>{{ if .Values.global.security.kerberos.enabled }}kerberos{{ else }}simple{{ end }}</value>'
-    replacement:
-      type: conditional
-      key: global.security.kerberos.enabled
-      when_true: '          <value>kerberos</value>'
-      when_false: '          <value>simple</value>'
+  # 3) подтверждение режима (block_all = REGISTRY_ONLY)
+  kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET config_dump 2>/dev/null \
+    | grep -ioE "block_all|allow_any" | sort -u
+  EOF)
+  ⎿  # подставь namespace ozone в NS
+     NS=<ozone-ns>
+     PROM=$(kubectl -n $NS get pod -l component=prometheus -o jsonpath='{.items[0].metadata.name}')
+     echo "PROM=$PROM"
 
+     # 1) есть ли вообще outbound-кластер/листенер на 9882?
+     kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET clusters 2>/dev/null | grep -E "9882|datanode" | head
+     echo "--- listeners 9882 ---"
+     kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET config_dump 2>/dev/null \
+       | grep -oE '"(0\.0\.0\.0|29\.64\.18\.190)_9882"' | sort -u
 
+     # 2) есть ли у датанода istio-sidecar (иначе он не mesh-эндпоинт)?
+     DN=$(kubectl -n $NS get pod -l component=datanode -o jsonpath='{.items[0].metadata.name}')
+     echo "--- datanode $DN containers ---"
+     kubectl -n $NS get pod $DN -o jsonpath='{.spec.containers[*].name}{"\n"}'
 
-        if rtype == 'conditional':
-            raw = get_nested(all_values, repl['key'])
-            branch = repl['when_true'] if raw else repl['when_false']
-            return resolve_format(branch, all_values)
-
-              type: conditional            — picks when_true/when_false by a bool value
+     # 3) подтверждение режима (block_all = REGISTRY_ONLY)
+     kubectl -n $NS exec $PROM -c istio-proxy -- pilot-agent request GET config_dump 2>/dev/null \
+       | grep -ioE "block_all|allow_any" | sort -u
