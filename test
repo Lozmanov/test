@@ -436,20 +436,22 @@ global:
 /* --- Применение манифеста. retries > 1 нужен для объектов за вебхуком lvms: он стоит с
        failurePolicy: Fail, а caBundle ему асинхронно прокидывает cainjector cert-manager'а,
        поэтому первый apply сразу после установки оператора может упасть.
-       retries передаётся всегда: значение по умолчанию в CPS-методе Groovy порождает
-       синтетический метод-обёртку, который не проходит CPS-трансформацию, и вызов
-       kube_apply(file) с одним аргументом молча не выполняет тело. --------------------------------------------------- */
+       У цикла обязательно должно быть явное условие: `for (init; ; update)` с пустым
+       условием CPS-движок Jenkins считает ложным и не выполняет тело ни разу — метод
+       молча возвращается, kubectl не запускается, а джоба рапортует успех.
+       retries передаётся всегда по той же причине: значение параметра по умолчанию
+       даёт синтетический метод-обёртку без CPS-трансформации. ---------------------------------------------------------- */
 def kube_apply(String file, int retries) {
-    for (int attempt = 1; ; attempt++) {
+    for (int attempt = 1; attempt <= retries; attempt++) {
         if (sh(script: "kubectl apply ${DRY_RUN ? '--dry-run=server' : ''} -f ${file}", returnStatus: true) == 0) {
             return
         }
-        if (attempt >= retries) {
-            error("""RLM.ERROR.START Не удалось применить ${file}, см. вывод kubectl в логе сборки RLM.ERROR.END""")
+        if (attempt < retries) {
+            println "apply ${file} не прошёл (попытка ${attempt}/${retries}), повтор через ${APPLY_RETRY_SEC}s"
+            sleep(time: APPLY_RETRY_SEC, unit: 'SECONDS')
         }
-        println "apply ${file} не прошёл (попытка ${attempt}/${retries}), повтор через ${APPLY_RETRY_SEC}s"
-        sleep(time: APPLY_RETRY_SEC, unit: 'SECONDS')
     }
+    error("""RLM.ERROR.START Не удалось применить ${file}, см. вывод kubectl в логе сборки RLM.ERROR.END""")
 }
 
 /* --- Шаг 1: установка оператора ----------------------------------------------------------------------------------- */
@@ -528,6 +530,18 @@ def create_lvm_cluster(List devices) {
         println "\n --- JOB_INFO: LVMCluster ${LVM_CLUSTER} уже описывает все ${diff.total} deviceClass'ов, apply пропущен --- \n"
         finalData.lvm_cluster_action = 'unchanged'
     }
+
+    if (DRY_RUN) { return }
+
+    // Сверка постфактум. `kubectl apply` может вернуть 0, не создав объект (dry-run,
+    // логин не в тот кластер), а шаг — не выполниться вовсе; тогда шаг обязан упасть,
+    // а не отрапортовать успех.
+    def created = split_list(sh(script: "kubectl -n ${LVM_NS} get lvmcluster ${LVM_CLUSTER} -o jsonpath='{.spec.storage.deviceClasses[*].name}' 2>/dev/null || true",
+                                returnStdout: true).trim())
+    if (created.size() != devices.size()) {
+        error("""RLM.ERROR.START После apply в CR ${LVM_CLUSTER} (ns ${LVM_NS}) ${created.size()} deviceClass'ов вместо ${devices.size()}: объект не создан или создан не полностью RLM.ERROR.END""")
+    }
+    println "\n --- JOB_INFO: в кластере CR ${LVM_CLUSTER}: ${created.size()} deviceClass'ов --- \n"
 }
 
 /* --- Шаг 3: PVC --------------------------------------------------------------------------------------------------- */
@@ -572,6 +586,15 @@ def create_pvcs(List volumes) {
         kube_apply(files[i], 1)
     }
     if (DRY_RUN) { return }
+
+    // Сверка постфактум, как и у LVMCluster: apply не должен «успешно» отработать вхолостую
+    def after = sh(script: "kubectl -n ${OZONE_NS} get pvc --no-headers -o custom-columns=NAME:.metadata.name,SC:.spec.storageClassName,SIZE:.spec.resources.requests.storage 2>/dev/null || true",
+                   returnStdout: true).trim()
+    def absent = []
+    for (v in volume_diff(volumes, after).missing) { absent << v.name }
+    if (absent) {
+        error("""RLM.ERROR.START После apply в ns ${OZONE_NS} нет ${absent.size()} PVC из ${volumes.size()} (${absent.take(5).join(', ')}): объекты не созданы RLM.ERROR.END""")
+    }
     finalData.pvc_created = missing.size()
 
     // StorageClass'ы topolvm — WaitForFirstConsumer, Bound появится только с pod'ами ozone
@@ -805,4 +828,3 @@ pipeline {
         }
     }
 }
-
