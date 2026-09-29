@@ -1,1 +1,7 @@
 
+        # Huck for SDPOZN-1136 to keep non-empty region for non-amazon endpoints
+        if not region_name and os.environ.get('S3_SIGV4_DUMMY_REGION', False):
+            region_name=os.environ.get('S3_SIGV4_DUMMY_REGION')
+
+
+if not chunk:
