@@ -1,7 +1,674 @@
-
-        # Huck for SDPOZN-1136 to keep non-empty region for non-amazon endpoints
-        if not region_name and os.environ.get('S3_SIGV4_DUMMY_REGION', False):
-            region_name=os.environ.get('S3_SIGV4_DUMMY_REGION')
-
-
-if not chunk:
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/kerberos.json b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/kerberos.json
+index 5a24c3a..3abdd21 100755
+--- a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/kerberos.json
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/kerberos.json
+@@ -11,6 +11,9 @@
+       "components": [
+         {
+           "name": "VECTOR_EXPORTER"
++        },
++        {
++          "name": "VECTOR_METRICS_EXPORTER"
+         }
+       ]
+     }
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/metainfo.xml b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/metainfo.xml
+index 2fbbe15..47f0fe0 100644
+--- a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/metainfo.xml
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/metainfo.xml
+@@ -34,6 +34,24 @@
+                         </configFile>
+                     </configFiles>
+                 </component>
++                <component>
++                    <name>VECTOR_METRICS_EXPORTER</name>
++                    <displayName>Vector Metrics Exporter</displayName>
++                    <category>SLAVE</category>
++                    <cardinality>0+</cardinality>
++                    <commandScript>
++                        <script>scripts/vector_metrics_exporter.py</script>
++                        <scriptType>PYTHON</scriptType>
++                        <timeout>1200</timeout>
++                    </commandScript>
++                    <configFiles>
++                        <configFile>
++                            <type>text</type>
++                            <fileName>vector.yaml</fileName>
++                            <dictionaryName>vector-metrics</dictionaryName>
++                        </configFile>
++                    </configFiles>
++                </component>
+             </components>
+ 
+             <osSpecifics>
+@@ -50,6 +68,7 @@
+             <configuration-dependencies>
+                 <config-type>vector</config-type>
+                 <config-type>logrotate</config-type>
++                <config-type>vector-metrics</config-type>
+             </configuration-dependencies>
+             <restartRequiredAfterChange>true</restartRequiredAfterChange>
+ 
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/params.py b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/params.py
+index fca119c..00972ca 100644
+--- a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/params.py
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/params.py
+@@ -1,4 +1,5 @@
+ #!/usr/bin/env python
++import json
+ import os
+ 
+ from resource_management.libraries.resources import HdfsResource
+@@ -68,3 +69,42 @@ vector_output_log_file = os.path.join(vector_log_dir, "vector-output.log")
+ vector_log_maxbackupindex = config['configurations']['vector-logrotate']['vector_log_maxbackupindex']
+ vector_log_maxfilesize = config['configurations']['vector-logrotate']['vector_log_maxfilesize']
+ logrotate_props = config['configurations']['vector-logrotate']['content']
++
++hostname = config['agentLevelParams']['hostname']
++
++vector_metrics_etc_dir = "/etc/vector/metrics"
++vector_metrics_data_dir = "/var/lib/vector/metrics"
++vector_metrics_pid_file = os.path.join(vector_pid_dir, "vector-metrics.pid")
++
++vector_metrics = config['configurations'].get('vector-metrics', {})
++vector_metrics_content = vector_metrics.get('content', '')
++vector_metrics_remote_write_url = json.dumps(vector_metrics.get('remote_write_url', ''))
++vector_metrics_tenant_id = json.dumps(vector_metrics['tenant_id']) if vector_metrics.get('tenant_id') else ''
++vector_metrics_auth_type = vector_metrics.get('auth_type', 'none')
++vector_metrics_auth_user = json.dumps(vector_metrics.get('auth_user', ''))
++vector_metrics_auth_password = json.dumps(vector_metrics.get('auth_password', ''))
++vector_metrics_auth_token = json.dumps(vector_metrics.get('auth_token', ''))
++vector_metrics_mtls_enabled = str(vector_metrics.get('mtls_enabled', 'false')).lower() == 'true'
++vector_metrics_tls_crt_file = json.dumps(vector_metrics.get('tls_crt_file', ''))
++vector_metrics_tls_key_file = json.dumps(vector_metrics.get('tls_key_file', ''))
++vector_metrics_tls_ca_file = json.dumps(vector_metrics['tls_ca_file']) if vector_metrics.get('tls_ca_file') else ''
++vector_metrics_tls_verify_certificate = str(vector_metrics.get('tls_verify_certificate', 'true')).lower()
++vector_metrics_scrape_interval_secs = int(vector_metrics.get('scrape_interval_secs', 30))
++
++ozone_site = config['configurations'].get('ozone-site', {})
++node_exporter_port = default("/configurations/node_exporter/node_exporter_port", "9101")
++
++vector_metrics_endpoints = [
++    ('node', 'node_exporter_hosts', "0.0.0.0:" + str(node_exporter_port), '/metrics'),
++    ('om', 'ozone_manager_hosts', ozone_site.get('ozone.om.http-address', '0.0.0.0:9874'), '/prom'),
++    ('scm', 'ozone_scm_hosts', ozone_site.get('hdds.scm.http-address', '0.0.0.0:9876'), '/prom'),
++    ('scm', 'ozone_scm_ha_init_hosts', ozone_site.get('hdds.scm.http-address', '0.0.0.0:9876'), '/prom'),
++    ('datanode', 'ozone_datanode_hosts', ozone_site.get('hdds.datanode.http-address', '0.0.0.0:9882'), '/prom'),
++    ('recon', 'ozone_recon_hosts', ozone_site.get('ozone.recon.http-address', '0.0.0.0:9888'), '/prom'),
++    ('s3g', 'ozone_s3g_hosts', ozone_site.get('ozone.s3g.http-address', '0.0.0.0:9878'), '/prom'),
++]
++
++vector_metrics_targets = []
++for job, hosts_key, address, path in vector_metrics_endpoints:
++    if hostname in default("/clusterHostInfo/" + hosts_key, []) and job not in dict(vector_metrics_targets):
++        vector_metrics_targets.append((job, "http://{0}:{1}{2}".format(hostname, address.split(':')[-1], path)))
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/vector_exporter.py b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/vector_exporter.py
+index 2aeffa0..0090e7b 100644
+--- a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/vector_exporter.py
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/vector_exporter.py
+@@ -84,7 +84,7 @@ class Master(Script):
+             )
+             raise
+         try:
+-            Execute("pidof vector > " + params.vector_server_pid_file, user="root")
++            Execute("systemctl show -p MainPID vector | cut -d'=' -f2 > " + params.vector_server_pid_file, user="root")
+         except:
+             Execute(format("journalctl -u vector.service --no-pager -n 40"),
+             logoutput = True,
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/configuration/node_exporter.xml b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/configuration/node_exporter.xml
+new file mode 100644
+index 0000000..758b4d4
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/configuration/node_exporter.xml
+@@ -0,0 +1,20 @@
++<?xml version="1.0"?>
++<?xml-stylesheet type="text/xsl" href="configuration.xsl"?>
++<configuration>
++    <property>
++        <name>node_exporter_pid_file</name>
++        <value>/var/run/sdp_node_exporter/sdp_node_exporter.pid</value>
++        <display-name>Node Exporter Pid File</display-name>
++        <on-ambari-upgrade add="true"/>
++    </property>
++    <property>
++        <name>node_exporter_port</name>
++        <value>9101</value>
++        <display-name>Node Exporter Port</display-name>
++        <description>Port for Node Exporter HTTP metrics endpoint</description>
++        <value-attributes>
++            <type>int</type>
++        </value-attributes>
++        <on-ambari-upgrade add="true"/>
++    </property>
++</configuration>
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/metainfo.xml b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/metainfo.xml
+new file mode 100644
+index 0000000..4f2b9e4
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/metainfo.xml
+@@ -0,0 +1,41 @@
++<?xml version="1.0"?>
++<metainfo>
++    <schemaVersion>2.0</schemaVersion>
++    <services>
++        <service>
++            <name>MONITORING</name>
++            <displayName>Monitoring</displayName>
++            <comment>Node exporter for cluster hosts</comment>
++            <version>0.0.2</version>
++            <components>
++                <component>
++                    <name>NODE_EXPORTER</name>
++                    <displayName>Node Exporter</displayName>
++                    <category>SLAVE</category>
++                    <cardinality>0+</cardinality>
++                    <commandScript>
++                        <script>scripts/node_exporter.py</script>
++                        <scriptType>PYTHON</scriptType>
++                        <timeout>1200</timeout>
++                    </commandScript>
++                </component>
++            </components>
++
++            <osSpecifics>
++                <osSpecific>
++                    <osFamily>any</osFamily>
++                    <packages>
++                        <package>
++                            <name>sdp_node_exporter</name>
++                        </package>
++                    </packages>
++                </osSpecific>
++            </osSpecifics>
++
++            <configuration-dependencies>
++                <config-type>node_exporter</config-type>
++            </configuration-dependencies>
++            <restartRequiredAfterChange>true</restartRequiredAfterChange>
++        </service>
++    </services>
++</metainfo>
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/scripts/node_exporter.py b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/scripts/node_exporter.py
+new file mode 100755
+index 0000000..539706f
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/scripts/node_exporter.py
+@@ -0,0 +1,82 @@
++#!/usr/bin/env python
++from resource_management import *
++import grp, pwd
++import os
++
++class Master(Script):
++    def install(self, env):
++        import params
++        env.set_params(params)
++        self.install_packages(env)
++        self.configure(env)
++
++    def configure(self, env):
++        import params
++        env.set_params(params)
++        try:
++            grp.getgrnam(params.node_exporter_group)
++        except KeyError:
++            Group(
++                group_name = params.node_exporter_group,
++                ignore_failures = True
++                )
++        try:
++            pwd.getpwnam(params.node_exporter_user)
++        except KeyError:
++            User(
++                username = params.node_exporter_user,
++                groups = [params.node_exporter_group],
++                ignore_failures = True
++                )
++
++        File(format("/etc/default/sdp_node_exporter"),
++             content = Template('sdp_node_exporter').get_content(),
++             owner = params.node_exporter_user,
++             group = params.node_exporter_group,
++             mode = 0o644
++        )
++
++        File(format("/usr/lib/systemd/system/sdp_node_exporter.service"),
++             content = Template('sdp_node_exporter.service').get_content(),
++             owner = "root",
++             group = "root",
++             mode = 0o644
++        )
++
++        Execute("systemctl daemon-reload", user="root")
++
++    def start(self, env, upgrade_type=None):
++        import params
++        env.set_params(params)
++        self.configure(env)
++
++        Directory(os.path.dirname(params.node_exporter_pid_file),
++                  owner = params.node_exporter_user,
++                  group = params.node_exporter_group,
++                  create_parents = True,
++                  mode = 0o755
++        )
++
++        File(params.node_exporter_pid_file, action = "delete")
++        Execute(format("systemctl start sdp_node_exporter"),user="root")
++        Execute("systemctl show -p MainPID sdp_node_exporter | cut -d'=' -f2 > " + params.node_exporter_pid_file, user="root")
++        File(params.node_exporter_pid_file,
++             owner = params.node_exporter_user,
++             group = params.node_exporter_group,
++             mode = 0o644)
++
++    def stop(self, env, upgrade_type=None):
++        import params
++        env.set_params(params)
++        Execute ("systemctl stop sdp_node_exporter", user="root", ignore_failures=True)
++        File(params.node_exporter_pid_file, action = "delete")
++
++    def status(self, env):
++        import params
++        env.set_params(params)
++        # use built-in method to check status using pidfile
++        check_process_status(params.node_exporter_pid_file)
++
++
++if __name__ == "__main__":
++    Master().execute()
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/scripts/params.py b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/scripts/params.py
+new file mode 100644
+index 0000000..bad2c8d
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/scripts/params.py
+@@ -0,0 +1,10 @@
++#!/usr/bin/env python
++from resource_management.libraries.functions.default import default
++from resource_management.libraries.script.script import Script
++
++config = Script.get_config()
++
++node_exporter_pid_file = default("/configurations/node_exporter/node_exporter_pid_file", "/var/run/sdp_node_exporter/sdp_node_exporter.pid")
++node_exporter_port = default("/configurations/node_exporter/node_exporter_port", "9101")
++node_exporter_user = default("/configurations/vector/vector_user", "vector")
++node_exporter_group = default("/configurations/vector/vector_group", "hadoop")
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/templates/sdp_node_exporter b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/templates/sdp_node_exporter
+new file mode 100644
+index 0000000..7e6a8c3
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/templates/sdp_node_exporter
+@@ -0,0 +1 @@
++NODE_EXPORTER_OPTS="--web.listen-address=:{{ node_exporter_port }} --collector.systemd --collector.processes"
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/templates/sdp_node_exporter.service b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/templates/sdp_node_exporter.service
+new file mode 100644
+index 0000000..0e06c6c
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/MONITORING/package/templates/sdp_node_exporter.service
+@@ -0,0 +1,18 @@
++# -*- mode: conf -*-
++
++[Unit]
++Description=Prometheus exporter for machine metrics, written in Go with pluggable metric collectors.
++Documentation=https://github.com/prometheus/node_exporter
++After=network.target
++
++[Service]
++User={{node_exporter_user}}
++Group={{node_exporter_group}}
++EnvironmentFile=-/etc/default/sdp_node_exporter
++ExecStart=/usr/share/sdp_node_exporter/node_exporter $NODE_EXPORTER_OPTS
++ExecReload=/bin/kill -HUP $MAINPID
++Restart=on-failure
++RestartSec=5s
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/configuration/vector-metrics.xml b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/configuration/vector-metrics.xml
+new file mode 100644
+index 0000000..8c28ec9
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/configuration/vector-metrics.xml
+@@ -0,0 +1,144 @@
++<configuration supports_adding_forbidden="true">
++  <property>
++    <name>remote_write_url</name>
++    <value></value>
++    <display-name>Remote write URL</display-name>
++    <description>Prometheus remote write endpoint, e.g. https://host/api/v1/push</description>
++    <value-attributes>
++      <empty-value-valid>true</empty-value-valid>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>tenant_id</name>
++    <value></value>
++    <display-name>Tenant ID</display-name>
++    <description>Sent as X-Scope-OrgID header. Empty - header is not sent.</description>
++    <value-attributes>
++      <empty-value-valid>true</empty-value-valid>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>auth_type</name>
++    <value>none</value>
++    <display-name>Authentication</display-name>
++    <description>HTTP authentication for remote write: none, basic or bearer. Can be combined with mTLS.</description>
++    <value-attributes>
++      <type>value-list</type>
++      <entries>
++        <entry>
++          <value>none</value>
++          <label>None</label>
++        </entry>
++        <entry>
++          <value>basic</value>
++          <label>Basic</label>
++        </entry>
++        <entry>
++          <value>bearer</value>
++          <label>Bearer token</label>
++        </entry>
++      </entries>
++      <selection-cardinality>1</selection-cardinality>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>auth_user</name>
++    <value></value>
++    <display-name>Basic auth user</display-name>
++    <value-attributes>
++      <empty-value-valid>true</empty-value-valid>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>auth_password</name>
++    <value></value>
++    <property-type>PASSWORD</property-type>
++    <display-name>Basic auth password</display-name>
++    <value-attributes>
++      <type>password</type>
++      <empty-value-valid>true</empty-value-valid>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>auth_token</name>
++    <value></value>
++    <property-type>PASSWORD</property-type>
++    <display-name>Bearer token</display-name>
++    <value-attributes>
++      <type>password</type>
++      <empty-value-valid>true</empty-value-valid>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>mtls_enabled</name>
++    <value>false</value>
++    <display-name>mTLS</display-name>
++    <description>Present client certificate to remote write endpoint</description>
++    <value-attributes>
++      <type>boolean</type>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>tls_crt_file</name>
++    <value>/run/certs/client_open.cer</value>
++    <display-name>Client certificate</display-name>
++    <description>Used when mTLS is enabled. Default is the client certificate issued by CERT_SYNC.</description>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>tls_key_file</name>
++    <value>/run/certs/client_private.key</value>
++    <display-name>Client private key</display-name>
++    <description>Used when mTLS is enabled. Default is the client key issued by CERT_SYNC.</description>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>tls_ca_file</name>
++    <value></value>
++    <display-name>CA file</display-name>
++    <description>CA bundle to verify remote write endpoint. Empty - system trust store. CERT_SYNC chain: /run/certs/client_chain.cer</description>
++    <value-attributes>
++      <empty-value-valid>true</empty-value-valid>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>tls_verify_certificate</name>
++    <value>true</value>
++    <display-name>Verify server certificate</display-name>
++    <value-attributes>
++      <type>boolean</type>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>scrape_interval_secs</name>
++    <value>30</value>
++    <display-name>Scrape interval</display-name>
++    <value-attributes>
++      <type>int</type>
++      <minimum>1</minimum>
++      <unit>seconds</unit>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++  <property>
++    <name>content</name>
++    <display-name>vector.yaml template</display-name>
++    <description>Vector metrics pipeline config template</description>
++    <value/>
++    <property-type>VALUE_FROM_PROPERTY_FILE</property-type>
++    <value-attributes>
++      <property-file-name>vector_metrics.yaml.j2</property-file-name>
++      <property-file-type>text</property-file-type>
++    </value-attributes>
++    <on-ambari-upgrade add="true" update="false"/>
++  </property>
++</configuration>
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/vector_metrics_exporter.py b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/vector_metrics_exporter.py
+new file mode 100644
+index 0000000..8938f98
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/scripts/vector_metrics_exporter.py
+@@ -0,0 +1,84 @@
++#!/usr/bin/env python
++import grp, pwd
++from resource_management import *
++
++class Master(Script):
++    def install(self, env):
++        import params
++        self.install_packages(env)
++        self.configure(env)
++
++    def configure(self, env):
++        import params
++        env.set_params(params)
++        try:
++            grp.getgrnam(params.vector_group)
++        except KeyError:
++            Group(
++                group_name = params.vector_group,
++                ignore_failures = True
++                )
++        try:
++            pwd.getpwnam(params.vector_user)
++        except KeyError:
++            User(
++                username = params.vector_user,
++                groups = [params.vector_group],
++                ignore_failures = True
++                )
++
++        File("/usr/lib/systemd/system/vector-metrics.service",
++            content=Template("vector-metrics.service.j2")
++        )
++
++        Directory(params.vector_metrics_etc_dir,
++                  owner=params.vector_user,
++                  group=params.vector_group,
++                  mode=0o750,
++                  create_parents=True)
++
++        File(format("{params.vector_metrics_etc_dir}/vector.yaml"),
++            content=InlineTemplate(params.vector_metrics_content),
++            owner=params.vector_user,
++            group=params.vector_group,
++            mode=0o600
++        )
++
++        Directory(params.vector_metrics_data_dir,
++                  owner=params.vector_user,
++                  group=params.vector_group,
++                  create_parents=True)
++
++        Execute("systemctl daemon-reload", user="root")
++
++    def start(self, env, upgrade_type=None):
++        import params
++        env.set_params(params)
++        if params.vector_metrics_remote_write_url == '""':
++            raise Fail("vector-metrics/remote_write_url is not set")
++        self.configure(env)
++        try:
++            Execute("systemctl start vector-metrics", user="root")
++            Execute("systemctl show -p MainPID vector-metrics | cut -d'=' -f2 > " + params.vector_metrics_pid_file, user="root")
++        except:
++            Execute("journalctl -u vector-metrics.service --no-pager -n 40",
++            logoutput = True,
++            ignore_failures = True,
++            user = "root",
++            )
++            raise
++
++    def stop(self, env, upgrade_type=None):
++        import params
++        env.set_params(params)
++        Execute("systemctl stop vector-metrics", user="root")
++        File(params.vector_metrics_pid_file, action="delete")
++
++    def status(self, env):
++        import params
++        env.set_params(params)
++        check_process_status(params.vector_metrics_pid_file)
++
++
++if __name__ == "__main__":
++    Master().execute()
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/templates/vector-metrics.service.j2 b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/templates/vector-metrics.service.j2
+new file mode 100644
+index 0000000..cf4d0b5
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/package/templates/vector-metrics.service.j2
+@@ -0,0 +1,18 @@
++[Unit]
++Description=Vector metrics
++Documentation=https://vector.dev
++After=network-online.target
++Requires=network-online.target
++
++[Service]
++User={{vector_user}}
++Group={{vector_group}}
++UMask=007
++ExecStartPre=/usr/bin/vector validate {{vector_metrics_etc_dir}}/vector.yaml
++ExecStart=/usr/bin/vector --config {{vector_metrics_etc_dir}}/vector.yaml
++ExecReload=/bin/kill -HUP $MAINPID
++Restart=always
++StartLimitInterval=10
++StartLimitBurst=5
++[Install]
++WantedBy=multi-user.target
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/properties/vector_metrics.yaml.j2 b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/properties/vector_metrics.yaml.j2
+new file mode 100644
+index 0000000..0b7becc
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/properties/vector_metrics.yaml.j2
+@@ -0,0 +1,68 @@
++---
++data_dir: {{ vector_metrics_data_dir }}
++
++sources:
++  scrape_vector:
++    type: internal_metrics
++    scrape_interval_secs: {{ vector_metrics_scrape_interval_secs }}
++{% for job, endpoint in vector_metrics_targets %}
++  scrape_{{ job }}:
++    type: prometheus_scrape
++    endpoints:
++      - {{ endpoint }}
++    scrape_interval_secs: {{ vector_metrics_scrape_interval_secs }}
++    instance_tag: instance
++    endpoint_tag: endpoint
++{% endfor %}
++
++transforms:
++  label_vector:
++    type: remap
++    inputs:
++      - scrape_vector
++    source: |
++      .tags.job = "vector"
++      .tags.cluster = "{{ cluster_name }}"
++      .tags.host = "{{ hostname }}"
++{% for job, endpoint in vector_metrics_targets %}
++  label_{{ job }}:
++    type: remap
++    inputs:
++      - scrape_{{ job }}
++    source: |
++      .tags.job = "{{ job }}"
++      .tags.cluster = "{{ cluster_name }}"
++      .tags.host = "{{ hostname }}"
++{% endfor %}
++
++sinks:
++  remote_write:
++    type: prometheus_remote_write
++    inputs:
++      - label_*
++    endpoint: {{ vector_metrics_remote_write_url }}
++{% if vector_metrics_tenant_id %}
++    tenant_id: {{ vector_metrics_tenant_id }}
++{% endif %}
++{% if vector_metrics_auth_type == 'basic' %}
++    auth:
++      strategy: basic
++      user: {{ vector_metrics_auth_user }}
++      password: {{ vector_metrics_auth_password }}
++{% elif vector_metrics_auth_type == 'bearer' %}
++    auth:
++      strategy: bearer
++      token: {{ vector_metrics_auth_token }}
++{% endif %}
++    tls:
++      verify_certificate: {{ vector_metrics_tls_verify_certificate }}
++      verify_hostname: {{ vector_metrics_tls_verify_certificate }}
++{% if vector_metrics_tls_ca_file %}
++      ca_file: {{ vector_metrics_tls_ca_file }}
++{% endif %}
++{% if vector_metrics_mtls_enabled %}
++      crt_file: {{ vector_metrics_tls_crt_file }}
++      key_file: {{ vector_metrics_tls_key_file }}
++{% endif %}
++    healthcheck:
++      enabled: false
+diff --git a/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/role_command_order.json b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/role_command_order.json
+new file mode 100644
+index 0000000..eeac290
+--- /dev/null
++++ b/ozone-stack/src/main/resources/stacks/OZONE/2.0.0/services/VECTOR/role_command_order.json
+@@ -0,0 +1,5 @@
++{
++  "general_deps": {
++    "VECTOR_METRICS_EXPORTER-START": ["CERT_SYNC_CLIENT-START", "NODE_EXPORTER-START"]
++  }
++}
